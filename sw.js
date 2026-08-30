@@ -1,8 +1,11 @@
-const CACHE = 'inkpad-v1';
+const CACHE = 'inkpad-v2';
 const ASSETS = [
-  '/',
-  '/index.html',
-  '/manifest.json',
+  '/note-PWA/',
+  '/note-PWA/index.html',
+  '/note-PWA/manifest.json',
+  '/note-PWA/sw.js',
+  '/note-PWA/icons/icon-192.png',
+  '/note-PWA/icons/icon-512.png',
   'https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap'
 ];
 
@@ -31,7 +34,7 @@ self.addEventListener('fetch', e => {
   // Network-first for navigation; cache-first for static assets
   if (e.request.mode === 'navigate') {
     e.respondWith(
-      fetch(e.request).catch(() => caches.match('/index.html'))
+      fetch(e.request).catch(() => caches.match('/note-PWA/index.html'))
     );
     return;
   }

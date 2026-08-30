@@ -2,7 +2,8 @@
   "name": "Inkpad",
   "short_name": "Inkpad",
   "description": "Write or draw your notes — stylus or keyboard",
-  "start_url": "/",
+  "start_url": "/note-PWA/",
+  "scope": "/note-PWA/",
   "display": "standalone",
   "background_color": "#1A1A1A",
   "theme_color": "#1A1A1A",
@@ -27,7 +28,7 @@
       "name": "New Note",
       "short_name": "New",
       "description": "Create a new note",
-      "url": "/?new=1",
+      "url": "/note-PWA/?new=1",
       "icons": [{ "src": "icons/icon-192.png", "sizes": "192x192" }]
     }
   ]
