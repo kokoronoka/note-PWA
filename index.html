@@ -1,0 +1,1398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#1A1A1A" />
+  <meta name="description" content="Inkpad — write or draw your notes" />
+  <link rel="manifest" href="manifest.json" />
+  <link rel="apple-touch-icon" href="icons/icon-192.png" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <!-- jsPDF: used by exportPDF() to build a real downloadable PDF -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <title>Inkpad</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #1A1A1A;
+      --surface: #242424;
+      --surface2: #2E2E2E;
+      --border: #3A3A3A;
+      --canvas-bg: #F0EDE6;
+      --ink: #1A1A1A;
+      --accent: #2D5BE3;
+      --accent-soft: #2D5BE315;
+      --text: #E8E4DC;
+      --text-muted: #888;
+      --danger: #E35B2D;
+      --font-ui: 'Space Grotesk', sans-serif;
+      --font-mono: 'JetBrains Mono', monospace;
+      --sidebar-w: 260px;
+      --radius: 10px;
+    }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-ui);
+      overflow: hidden;
+    }
+
+    /* ── Layout ── */
+    .app {
+      display: flex;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* ── Sidebar ── */
+    .sidebar {
+      width: var(--sidebar-w);
+      min-width: var(--sidebar-w);
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      transition: transform 0.25s ease;
+      z-index: 20;
+    }
+
+    .sidebar-header {
+      padding: 20px 16px 14px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .logo {
+      font-size: 18px;
+      font-weight: 600;
+      letter-spacing: -0.3px;
+      color: var(--text);
+    }
+
+    .logo span {
+      color: var(--accent);
+    }
+
+    .btn-new {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 7px;
+      padding: 7px 14px;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }
+    .btn-new:hover { opacity: 0.85; }
+
+    .search-wrap {
+      padding: 12px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .search-input {
+      width: 100%;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: 8px 12px;
+      color: var(--text);
+      font-family: var(--font-ui);
+      font-size: 13px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    .search-input::placeholder { color: var(--text-muted); }
+    .search-input:focus { border-color: var(--accent); }
+
+    .notes-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px;
+    }
+    .notes-list::-webkit-scrollbar { width: 4px; }
+    .notes-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+    .note-item {
+      padding: 12px;
+      border-radius: var(--radius);
+      cursor: pointer;
+      margin-bottom: 4px;
+      transition: background 0.12s;
+      position: relative;
+    }
+    .note-item:hover { background: var(--surface2); }
+    .note-item.active { background: var(--accent-soft); border: 1px solid var(--accent)44; }
+
+    .note-item-title {
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      margin-bottom: 4px;
+    }
+
+    .note-item-meta {
+      font-size: 11px;
+      color: var(--text-muted);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .note-type-badge {
+      font-size: 10px;
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: var(--surface2);
+      color: var(--text-muted);
+    }
+    .note-type-badge.ink { background: #2D5BE322; color: var(--accent); }
+
+    .note-item-delete {
+      position: absolute;
+      right: 8px;
+      top: 50%;
+      transform: translateY(-50%);
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      opacity: 0;
+      font-size: 16px;
+      padding: 4px;
+      border-radius: 4px;
+      transition: opacity 0.15s, color 0.15s;
+      line-height: 1;
+    }
+    .note-item:hover .note-item-delete { opacity: 1; }
+    .note-item-delete:hover { color: var(--danger); }
+
+    .sidebar-footer {
+      padding: 12px;
+      border-top: 1px solid var(--border);
+      font-size: 11px;
+      color: var(--text-muted);
+      text-align: center;
+    }
+
+    /* ── Main ── */
+    .main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .toolbar {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 10px 20px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .note-title-input {
+      flex: 1;
+      background: none;
+      border: none;
+      color: var(--text);
+      font-family: var(--font-ui);
+      font-size: 15px;
+      font-weight: 500;
+      outline: none;
+      min-width: 120px;
+    }
+    .note-title-input::placeholder { color: var(--text-muted); }
+
+    .toolbar-divider {
+      width: 1px;
+      height: 24px;
+      background: var(--border);
+    }
+
+    /* ── Mode Toggle ── */
+    .mode-toggle {
+      display: flex;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 3px;
+      gap: 2px;
+    }
+
+    .mode-btn {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      padding: 6px 14px;
+      border-radius: 6px;
+      font-family: var(--font-ui);
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.15s;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .mode-btn.active {
+      background: var(--accent);
+      color: #fff;
+    }
+    .mode-btn svg { width: 14px; height: 14px; }
+
+    /* ── Ink toolbar ── */
+    .ink-tools {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .tool-btn {
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      color: var(--text-muted);
+      width: 34px;
+      height: 34px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: all 0.15s;
+      font-size: 14px;
+    }
+    .tool-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .tool-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+    .stroke-size {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--text-muted);
+      font-size: 12px;
+    }
+    .stroke-size input[type=range] {
+      width: 80px;
+      accent-color: var(--accent);
+    }
+
+    .color-picker-wrap {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .color-swatch {
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      border: 2px solid var(--border);
+      cursor: pointer;
+      transition: transform 0.1s, border-color 0.1s;
+    }
+    .color-swatch:hover, .color-swatch.active { transform: scale(1.2); border-color: var(--text); }
+
+    .color-input {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      border: 2px solid var(--border);
+      cursor: pointer;
+      padding: 0;
+      background: none;
+      overflow: hidden;
+    }
+
+    .save-status {
+      margin-left: auto;
+      font-size: 12px;
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+    }
+
+    .btn-icon {
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      color: var(--text-muted);
+      width: 34px;
+      height: 34px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-size: 16px;
+      transition: all 0.15s;
+    }
+    .btn-icon:hover { border-color: var(--accent); color: var(--accent); }
+
+    /* ── Canvas area ──
+       The canvas is a large fixed-size page (3000x2000); navigation is via
+       pinch/scroll-wheel zoom and two-finger/middle-mouse pan, applied as a
+       CSS transform on #canvasTransformWrap — not native scrolling. */
+    .canvas-wrap {
+      flex: 1;
+      overflow: hidden;
+      position: relative;
+      background: var(--bg);
+    }
+
+    #canvasTransformWrap {
+      position: absolute;
+      top: 0;
+      left: 0;
+      transform-origin: 0 0;
+      will-change: transform;
+    }
+
+    .note-canvas {
+      background: var(--canvas-bg);
+      border-radius: 4px;
+      box-shadow: 0 4px 40px #00000055;
+      display: block;
+      touch-action: none;
+      cursor: crosshair;
+    }
+    .note-canvas.eraser-mode { cursor: cell; }
+
+    /* ── Zoom controls (ink mode only, see setMode()) ── */
+    .zoom-controls {
+      position: absolute;
+      right: 16px;
+      bottom: 16px;
+      display: flex;
+      align-items: center;
+      gap: 2px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 4px;
+      box-shadow: 0 4px 20px #00000055;
+      z-index: 3;
+    }
+    .zoom-btn {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      width: 26px;
+      height: 26px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 15px;
+      font-family: var(--font-ui);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.15s;
+    }
+    .zoom-btn:hover { background: var(--surface2); color: var(--text); }
+    .zoom-label {
+      font-size: 11px;
+      color: var(--text-muted);
+      min-width: 36px;
+      text-align: center;
+      font-family: var(--font-mono);
+    }
+
+    /* ── Text area ── */
+    .text-area-wrap {
+      flex: 1;
+      overflow: auto;
+      padding: 24px;
+      display: flex;
+      justify-content: center;
+    }
+
+    .note-textarea {
+      width: 100%;
+      max-width: 720px;
+      min-height: 100%;
+      background: var(--canvas-bg);
+      border: none;
+      border-radius: 4px;
+      box-shadow: 0 4px 40px #00000055;
+      padding: 40px 48px;
+      font-family: var(--font-mono);
+      font-size: 15px;
+      line-height: 1.8;
+      color: var(--ink);
+      resize: none;
+      outline: none;
+    }
+
+    /* ── Combined ink + text surface ──
+       Both layers are always mounted, stacked absolutely on top of each
+       other. Which one is "active" (on top, interactive) is controlled by
+       .layer-active / .layer-inactive, toggled in setMode(). */
+    .note-surface {
+      position: relative;
+      flex: 1;
+      overflow: hidden;
+    }
+    .note-surface .canvas-wrap,
+    .note-surface .text-area-wrap {
+      position: absolute;
+      inset: 0;
+      transition: opacity 0.15s ease;
+    }
+    .layer-active { z-index: 2; pointer-events: auto; opacity: 1; }
+    .layer-inactive { z-index: 1; pointer-events: none; opacity: 0.35; }
+
+    /* ── Empty state ── */
+    .empty-state {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      color: var(--text-muted);
+    }
+    .empty-state svg { opacity: 0.3; }
+    .empty-state p { font-size: 14px; }
+    .empty-state strong { color: var(--text); display: block; font-size: 18px; font-weight: 500; text-align: center; margin-bottom: 4px; }
+
+    /* ── Mobile sidebar toggle ── */
+    .mobile-bar {
+      display: none;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 10px 16px;
+      align-items: center;
+      gap: 12px;
+    }
+    .btn-menu {
+      background: none;
+      border: none;
+      color: var(--text);
+      font-size: 20px;
+      cursor: pointer;
+      padding: 4px;
+    }
+
+    @media (max-width: 680px) {
+      .sidebar {
+        position: fixed;
+        top: 0; left: 0; bottom: 0;
+        transform: translateX(-100%);
+        box-shadow: 4px 0 30px #00000066;
+      }
+      .sidebar.open { transform: translateX(0); }
+      .mobile-bar { display: flex; }
+      .text-area-wrap { padding: 12px; }
+      .note-textarea { padding: 20px 20px; }
+      .toolbar { padding: 8px 12px; gap: 8px; }
+    }
+
+    /* fade-in on note switch */
+    .fade-in { animation: fadeIn 0.18s ease; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+  </style>
+</head>
+<body>
+
+<div class="app" id="app">
+  <!-- Sidebar -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <div class="logo">Ink<span>pad</span></div>
+      <button class="btn-new" id="btnNew">+ New</button>
+    </div>
+    <div class="search-wrap">
+      <input class="search-input" id="searchInput" type="text" placeholder="Search notes…" />
+    </div>
+    <div class="notes-list" id="notesList"></div>
+    <div class="sidebar-footer" id="noteCount">0 notes</div>
+  </aside>
+
+  <!-- Main -->
+  <div class="main" id="main">
+    <div class="mobile-bar">
+      <button class="btn-menu" id="btnMenu">☰</button>
+      <span style="font-size:15px;font-weight:600">Inkpad</span>
+    </div>
+
+    <!-- Toolbar (hidden when no note) -->
+    <div class="toolbar" id="toolbar" style="display:none">
+      <input class="note-title-input" id="noteTitleInput" type="text" placeholder="Untitled note" />
+      <div class="toolbar-divider"></div>
+
+      <!-- Mode toggle -->
+      <div class="mode-toggle">
+        <button class="mode-btn active" id="modeInk" title="Ink / Stylus">
+          <svg viewBox="0 0 16 16" fill="currentColor"><path d="M13.5 1.5a1.5 1.5 0 0 1 0 2.12L5.33 11.8 2 14l2.2-3.33 8.17-8.17a1.5 1.5 0 0 1 2.13 0z"/></svg>
+          Ink
+        </button>
+        <button class="mode-btn" id="modeType" title="Keyboard typing">
+          <svg viewBox="0 0 16 16" fill="currentColor"><rect x="1" y="3" width="14" height="10" rx="1.5" ry="1.5" fill="none" stroke="currentColor" stroke-width="1.4"/><rect x="3.5" y="6" width="1.5" height="1.5" rx=".4"/><rect x="6.5" y="6" width="1.5" height="1.5" rx=".4"/><rect x="9.5" y="6" width="1.5" height="1.5" rx=".4"/><rect x="3.5" y="8.5" width="7" height="1.5" rx=".4"/></svg>
+          Type
+        </button>
+      </div>
+
+      <div class="toolbar-divider"></div>
+
+      <!-- Ink tools (shown in ink mode) -->
+      <div class="ink-tools" id="inkTools">
+        <button class="tool-btn active" id="toolPen" title="Pen">✏️</button>
+        <button class="tool-btn" id="toolEraser" title="Eraser">⬜</button>
+        <div class="stroke-size">
+          <span>Size</span>
+          <input type="range" id="strokeSize" min="1" max="30" value="3" />
+        </div>
+        <div class="color-picker-wrap" id="colorSwatches">
+          <div class="color-swatch active" data-color="#1A1A1A" style="background:#1A1A1A" title="Black"></div>
+          <div class="color-swatch" data-color="#2D5BE3" style="background:#2D5BE3" title="Blue"></div>
+          <div class="color-swatch" data-color="#E35B2D" style="background:#E35B2D" title="Red"></div>
+          <div class="color-swatch" data-color="#2DB85B" style="background:#2DB85B" title="Green"></div>
+          <div class="color-swatch" data-color="#9B2DE3" style="background:#9B2DE3" title="Purple"></div>
+          <input type="color" class="color-input" id="colorCustom" value="#1A1A1A" title="Custom color" />
+        </div>
+        <button class="tool-btn" id="toolClear" title="Clear canvas" style="margin-left:4px">🗑</button>
+        <button class="btn-icon" id="toolUndo" title="Undo">↩</button>
+      </div>
+
+      <span class="save-status" id="saveStatus">saved</span>
+
+      <!-- Export buttons (PNG / PDF / TXT). TXT is type-mode only, see setMode() -->
+      <button class="btn-icon" id="btnExportPNG" title="Export as PNG">🖼</button>
+      <button class="btn-icon" id="btnExportPDF" title="Export as PDF">📄</button>
+      <button class="btn-icon" id="btnExportTXT" title="Export as TXT" style="display:none">🗒</button>
+    </div>
+
+    <!-- Empty state -->
+    <div class="empty-state" id="emptyState">
+      <svg width="80" height="80" viewBox="0 0 80 80" fill="none">
+        <rect x="14" y="10" width="52" height="60" rx="6" fill="#2D5BE3" opacity=".15"/>
+        <rect x="14" y="10" width="52" height="60" rx="6" stroke="#2D5BE3" stroke-width="2" opacity=".4"/>
+        <line x1="26" y1="30" x2="54" y2="30" stroke="#2D5BE3" stroke-width="2.5" stroke-linecap="round" opacity=".5"/>
+        <line x1="26" y1="40" x2="48" y2="40" stroke="#2D5BE3" stroke-width="2.5" stroke-linecap="round" opacity=".5"/>
+        <line x1="26" y1="50" x2="42" y2="50" stroke="#2D5BE3" stroke-width="2.5" stroke-linecap="round" opacity=".5"/>
+        <path d="M58 54 L70 42 L74 46 L62 58 Z" fill="#2D5BE3" opacity=".6"/>
+      </svg>
+      <div>
+        <strong>No note selected</strong>
+        <p>Create a new note or pick one from the list</p>
+      </div>
+      <button class="btn-new" onclick="createNote()" style="font-size:14px;padding:10px 24px">Create your first note</button>
+    </div>
+
+    <!-- Combined ink + text surface: both layers stay mounted; setMode()
+         toggles which one is on top via .layer-active / .layer-inactive -->
+    <div class="note-surface" id="noteSurface" style="display:none">
+      <div class="canvas-wrap" id="canvasWrap">
+        <div id="canvasTransformWrap">
+          <canvas class="note-canvas" id="noteCanvas"></canvas>
+        </div>
+        <!-- Zoom controls: ink mode only, see setMode() -->
+        <div class="zoom-controls" id="zoomControls">
+          <button class="zoom-btn" id="zoomOutBtn" title="Zoom out">−</button>
+          <span class="zoom-label" id="zoomLabel">100%</span>
+          <button class="zoom-btn" id="zoomInBtn" title="Zoom in">+</button>
+          <button class="zoom-btn" id="zoomResetBtn" title="Reset zoom">⊡</button>
+        </div>
+      </div>
+      <div class="text-area-wrap" id="typeWrap">
+        <textarea class="note-textarea" id="noteTextarea" placeholder="Start typing your note here…"></textarea>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── State ──
+let notes = JSON.parse(localStorage.getItem('inkpad_notes') || '[]');
+let activeId = null;
+let mode = 'ink'; // 'ink' | 'type'
+let drawing = false;
+let lastX = 0, lastY = 0;
+let currentColor = '#1A1A1A';
+let strokeWidth = 3;
+let isEraser = false;
+let undoStack = [];
+let saveTimer = null;
+let searchQuery = '';
+
+// ── Zoom & pan state ──
+// The canvas is a large fixed-size page; zoom/pan are a CSS transform on
+// #canvasTransformWrap, independent of the canvas's own pixel content (so
+// undo/redo — which only touches canvas pixels — never affects them).
+const CANVAS_W = 3000, CANVAS_H = 2000;
+const MIN_ZOOM = 0.3, MAX_ZOOM = 5.0;
+let zoom = 1, panX = 0, panY = 0;
+const activeTouches = new Map(); // pointerId -> {x, y} in canvasWrap-local space
+let pinch = null;                // { startDist, anchorCanvasPt } while a 2-finger gesture is active
+let middleDrag = null;           // { startX, startY, startPanX, startPanY } while middle-mouse-dragging
+
+const canvas = document.getElementById('noteCanvas');
+const ctx = canvas.getContext('2d');
+
+// ── Init ──
+function init() {
+  initCanvasSize();
+  if (notes.length === 0) createNote();
+  else {
+    renderList();
+    selectNote(notes[0].id);
+  }
+  registerSW();
+}
+
+// ── Service Worker ──
+function registerSW() {
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+  }
+}
+
+// ── Note CRUD ──
+function generateId() { return Date.now().toString(36) + Math.random().toString(36).slice(2); }
+
+function createNote() {
+  const note = {
+    id: generateId(),
+    title: '',
+    type: 'ink',
+    inkData: null,
+    textData: '',
+    zoom: 1,
+    panX: 0,
+    panY: 0,
+    created: Date.now(),
+    updated: Date.now()
+  };
+  notes.unshift(note);
+  saveNotes();
+  renderList();
+  selectNote(note.id); // selectNote() saves the outgoing note, then clears the textarea before loading this one
+  // Focus title
+  setTimeout(() => document.getElementById('noteTitleInput').focus(), 50);
+}
+
+function deleteNote(id, e) {
+  e.stopPropagation();
+  notes = notes.filter(n => n.id !== id);
+  saveNotes();
+  if (activeId === id) {
+    activeId = null;
+    if (notes.length > 0) selectNote(notes[0].id);
+    else showEmpty();
+  }
+  renderList();
+}
+
+function saveNotes() {
+  localStorage.setItem('inkpad_notes', JSON.stringify(notes));
+}
+
+function getActive() { return notes.find(n => n.id === activeId); }
+
+// ── Save current note state ──
+function saveActiveNote() {
+  const note = getActive();
+  if (!note) return;
+  note.title = document.getElementById('noteTitleInput').value;
+  note.updated = Date.now();
+  note.type = mode;
+  note.zoom = zoom;
+  note.panX = panX;
+  note.panY = panY;
+  if (mode === 'ink') {
+    note.inkData = canvas.toDataURL();
+  } else {
+    note.textData = document.getElementById('noteTextarea').value;
+  }
+  saveNotes();
+  setSaveStatus('saved');
+  renderList();
+}
+
+function debounceSave() {
+  setSaveStatus('saving…');
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveActiveNote, 800);
+}
+
+function setSaveStatus(txt) {
+  document.getElementById('saveStatus').textContent = txt;
+}
+
+// ── Select Note ──
+function selectNote(id) {
+  // Save previous
+  if (activeId && activeId !== id) saveActiveNote();
+
+  activeId = id;
+  const note = getActive();
+  if (!note) return;
+
+  // Show toolbar + note surface
+  document.getElementById('emptyState').style.display = 'none';
+  document.getElementById('toolbar').style.display = 'flex';
+  document.getElementById('noteSurface').style.display = 'flex';
+
+  // Set title
+  document.getElementById('noteTitleInput').value = note.title;
+
+  // Restore this note's own zoom/pan (defaults to 100% at origin 0,0)
+  zoom = note.zoom || 1;
+  panX = note.panX || 0;
+  panY = note.panY || 0;
+  applyTransform();
+
+  // Show the correct layer on top
+  setMode(note.type || 'ink', false);
+
+  // Always load BOTH layers — every note keeps its ink and its text
+  // independently, regardless of which one is currently on top. This also
+  // guarantees no previous note's ink or text can bleed into this one.
+  undoStack = [];
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  document.getElementById('noteTextarea').value = note.textData || '';
+  if (note.inkData) {
+    const img = new Image();
+    img.onload = () => {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0);
+      saveSnapshot();
+    };
+    img.src = note.inkData;
+  }
+
+  setSaveStatus('saved');
+  renderList();
+}
+
+// ── Mode Switch ──
+// Switching modes only changes which layer is on top/interactive — both
+// layers stay mounted and their data is never cleared or discarded here.
+function setMode(m, save = true) {
+  if (save && activeId) saveActiveNote();
+  mode = m;
+
+  document.getElementById('modeInk').classList.toggle('active', m === 'ink');
+  document.getElementById('modeType').classList.toggle('active', m === 'type');
+  document.getElementById('inkTools').style.display = m === 'ink' ? 'flex' : 'none';
+  document.getElementById('btnExportTXT').style.display = m === 'type' ? 'flex' : 'none';
+  document.getElementById('zoomControls').style.display = m === 'ink' ? 'flex' : 'none';
+
+  // Active layer on top and interactive; the other stays visible underneath
+  // as a faded, read-only underlay
+  const canvasWrap = document.getElementById('canvasWrap');
+  const typeWrap = document.getElementById('typeWrap');
+  canvasWrap.classList.toggle('layer-active', m === 'ink');
+  canvasWrap.classList.toggle('layer-inactive', m !== 'ink');
+  typeWrap.classList.toggle('layer-active', m === 'type');
+  typeWrap.classList.toggle('layer-inactive', m !== 'type');
+  if (m === 'ink') document.getElementById('noteTextarea').blur();
+
+  const note = getActive();
+  if (note) note.type = m;
+}
+
+// ── Canvas ──
+// The canvas is a fixed-size logical page (CANVAS_W x CANVAS_H), sized once.
+// Zoom/pan never touch these dimensions — they only move the CSS transform.
+function initCanvasSize() {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.style.width = CANVAS_W + 'px';
+  canvas.style.height = CANVAS_H + 'px';
+  canvas.width = CANVAS_W * dpr;
+  canvas.height = CANVAS_H * dpr;
+  ctx.scale(dpr, dpr);
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+}
+
+function saveSnapshot() {
+  undoStack.push(canvas.toDataURL());
+  if (undoStack.length > 30) undoStack.shift();
+}
+
+// ── Zoom & pan ──
+// screenX/Y here are relative to #canvasWrap's own (untransformed) box —
+// the stable reference frame the zoom/pan transform is measured against.
+function wrapPoint(e) {
+  const rect = document.getElementById('canvasWrap').getBoundingClientRect();
+  return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+}
+
+// Inverse of the transform below: canvasX = (screenX - panX) / zoom
+function canvasPointFromScreen(sx, sy) {
+  return { x: (sx - panX) / zoom, y: (sy - panY) / zoom };
+}
+
+// Keep at least 200px of the canvas visible in the viewport on each axis,
+// so panning can never push the whole page off screen.
+const MIN_VISIBLE = 200;
+function clampPan() {
+  const wrap = document.getElementById('canvasWrap');
+  const w = wrap.clientWidth, h = wrap.clientHeight;
+  const visW = CANVAS_W * zoom, visH = CANVAS_H * zoom;
+  const minX = Math.min(MIN_VISIBLE - visW, w - MIN_VISIBLE);
+  const maxX = Math.max(MIN_VISIBLE - visW, w - MIN_VISIBLE);
+  panX = Math.min(maxX, Math.max(minX, panX));
+  const minY = Math.min(MIN_VISIBLE - visH, h - MIN_VISIBLE);
+  const maxY = Math.max(MIN_VISIBLE - visH, h - MIN_VISIBLE);
+  panY = Math.min(maxY, Math.max(minY, panY));
+}
+
+function applyTransform() {
+  clampPan();
+  document.getElementById('canvasTransformWrap').style.transform =
+    `translate(${panX}px, ${panY}px) scale(${zoom})`;
+  document.getElementById('zoomLabel').textContent = Math.round(zoom * 100) + '%';
+}
+
+// Change zoom while keeping the canvas point under (anchorX, anchorY) fixed
+// on screen — i.e. zoom "toward" that point rather than toward the origin.
+function setZoom(newZoom, anchorX, anchorY) {
+  newZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, newZoom));
+  const pt = canvasPointFromScreen(anchorX, anchorY);
+  panX = anchorX - pt.x * newZoom;
+  panY = anchorY - pt.y * newZoom;
+  zoom = newZoom;
+  applyTransform();
+}
+
+function zoomByButton(factor) {
+  const rect = document.getElementById('canvasWrap').getBoundingClientRect();
+  setZoom(zoom * factor, rect.width / 2, rect.height / 2);
+  debounceSave();
+}
+
+function resetZoom() {
+  zoom = 1;
+  panX = 0;
+  panY = 0;
+  applyTransform();
+  debounceSave();
+}
+
+function pinchDistance(p1, p2) { return Math.hypot(p1.x - p2.x, p1.y - p2.y); }
+function pinchMidpoint(p1, p2) { return { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 }; }
+
+// Recompute zoom+pan from the two active touches vs. their state when the
+// pinch gesture started — handles pinch-zoom and two-finger drag-to-pan
+// together (a pure drag is just a pinch with an unchanged finger distance).
+// At zoom <= 1.0 the whole page already fits, so panning is a no-op there —
+// only the zoom itself responds until the gesture pushes past 1.0.
+function updatePinch() {
+  const pts = [...activeTouches.values()];
+  if (pts.length < 2 || !pinch) return;
+  const [p1, p2] = pts;
+  const dist = pinchDistance(p1, p2);
+  const mid = pinchMidpoint(p1, p2);
+  const newZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, pinch.startZoom * (dist / pinch.startDist)));
+
+  if (newZoom > 1) {
+    panX = mid.x - pinch.anchorCanvasPt.x * newZoom;
+    panY = mid.y - pinch.anchorCanvasPt.y * newZoom;
+  } else {
+    // Still at (or below) the 1.0 floor: keep re-anchoring to the current
+    // midpoint (computed against this frame's own forced zoom/pan, not the
+    // stale globals) so that if the gesture later pushes past 1.0, panning
+    // picks up smoothly from there instead of jumping.
+    panX = 0;
+    panY = 0;
+    pinch.anchorCanvasPt = { x: mid.x / newZoom, y: mid.y / newZoom };
+  }
+  zoom = newZoom;
+  applyTransform();
+}
+
+function getPos(e) {
+  const p = wrapPoint(e);
+  const c = canvasPointFromScreen(p.x, p.y);
+  return { x: c.x, y: c.y, pressure: e.pressure !== undefined && e.pressure > 0 ? e.pressure : 0.5 };
+}
+
+function startDraw(e) {
+  e.preventDefault();
+  const pos = getPos(e);
+  drawing = true;
+  lastX = pos.x;
+  lastY = pos.y;
+  ctx.beginPath();
+  ctx.moveTo(lastX, lastY);
+  saveSnapshot();
+}
+
+function draw(e) {
+  if (!drawing) return;
+  e.preventDefault();
+  const pos = getPos(e);
+  const pressure = pos.pressure > 0 ? pos.pressure : 0.5;
+  const dynamicWidth = isEraser ? 20 : strokeWidth * (0.5 + pressure * 1.2);
+
+  ctx.globalCompositeOperation = isEraser ? 'destination-out' : 'source-over';
+  ctx.strokeStyle = isEraser ? 'rgba(0,0,0,1)' : currentColor;
+  ctx.lineWidth = dynamicWidth;
+
+  ctx.lineTo(pos.x, pos.y);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(pos.x, pos.y);
+
+  lastX = pos.x;
+  lastY = pos.y;
+  debounceSave();
+}
+
+function endDraw(e) {
+  if (!drawing) return;
+  drawing = false;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+// Pointer events handle all three input kinds. Touch is tracked separately
+// (activeTouches) so a 2nd finger starts a pinch/pan instead of a 2nd stroke;
+// mouse/pen always draw, except a middle-mouse-button drag, which pans.
+canvas.addEventListener('pointerdown', e => {
+  if (e.pointerType === 'touch') {
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    activeTouches.set(e.pointerId, wrapPoint(e));
+    if (activeTouches.size === 1) {
+      e.preventDefault();
+      startDraw(e);
+    } else if (activeTouches.size === 2) {
+      endDraw(e); // a 2nd finger cancels any in-progress single-finger stroke
+      const [p1, p2] = [...activeTouches.values()];
+      const mid = pinchMidpoint(p1, p2);
+      pinch = { startDist: pinchDistance(p1, p2), startZoom: zoom, anchorCanvasPt: canvasPointFromScreen(mid.x, mid.y) };
+    }
+    return;
+  }
+
+  // Middle-mouse-button drag, or Space held + left-click drag, both pan
+  if (e.pointerType === 'mouse' && (e.button === 1 || (e.button === 0 && spaceHeld))) {
+    e.preventDefault();
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    middleDrag = { startX: e.clientX, startY: e.clientY, startPanX: panX, startPanY: panY };
+    canvas.style.cursor = 'grabbing';
+    return;
+  }
+
+  // Left-click mouse or pen: draw
+  startDraw(e);
+}, { passive: false });
+
+canvas.addEventListener('pointermove', e => {
+  if (e.pointerType === 'touch' && activeTouches.has(e.pointerId)) {
+    activeTouches.set(e.pointerId, wrapPoint(e));
+    if (activeTouches.size >= 2 && pinch) {
+      e.preventDefault();
+      updatePinch();
+      debounceSave();
+    } else if (activeTouches.size === 1 && drawing) {
+      e.preventDefault();
+      draw(e);
+    }
+    return;
+  }
+
+  if (middleDrag) {
+    e.preventDefault();
+    panX = middleDrag.startPanX + (e.clientX - middleDrag.startX);
+    panY = middleDrag.startPanY + (e.clientY - middleDrag.startY);
+    applyTransform();
+    debounceSave();
+    return;
+  }
+
+  draw(e);
+}, { passive: false });
+
+function releasePointer(e) {
+  if (e.pointerType === 'touch') {
+    activeTouches.delete(e.pointerId);
+    if (activeTouches.size < 2) pinch = null;
+    if (activeTouches.size === 0) endDraw(e);
+    return;
+  }
+  // Checked by state, not button number, so a Space+left-click pan (button
+  // 0) still ends correctly here, not just an actual middle-click (button 1)
+  if (middleDrag) {
+    middleDrag = null;
+    canvas.style.cursor = spaceHeld ? 'grab' : '';
+    return;
+  }
+  endDraw(e);
+}
+canvas.addEventListener('pointerup', releasePointer);
+canvas.addEventListener('pointercancel', releasePointer);
+canvas.addEventListener('pointerout', releasePointer);
+
+// Ctrl + scroll wheel to zoom, anchored at the cursor position
+document.getElementById('canvasWrap').addEventListener('wheel', e => {
+  if (!e.ctrlKey) return;
+  e.preventDefault();
+  const p = wrapPoint(e);
+  setZoom(zoom * Math.exp(-e.deltaY * 0.0015), p.x, p.y);
+  debounceSave();
+}, { passive: false });
+
+// Zoom control buttons
+document.getElementById('zoomInBtn').addEventListener('click', () => zoomByButton(1.25));
+document.getElementById('zoomOutBtn').addEventListener('click', () => zoomByButton(1 / 1.25));
+document.getElementById('zoomResetBtn').addEventListener('click', resetZoom);
+
+// Space + left-click drag to pan (bonus, common in design tools). Ignored
+// while typing in the title/textarea so a literal space still works there.
+let spaceHeld = false;
+function isTypingTarget(el) {
+  return el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA');
+}
+document.addEventListener('keydown', e => {
+  if (e.code === 'Space' && !spaceHeld && !isTypingTarget(e.target)) {
+    spaceHeld = true;
+    canvas.style.cursor = 'grab';
+    e.preventDefault();
+  }
+});
+document.addEventListener('keyup', e => {
+  if (e.code === 'Space') {
+    spaceHeld = false;
+    if (!middleDrag) canvas.style.cursor = '';
+  }
+});
+window.addEventListener('blur', () => {
+  spaceHeld = false;
+  if (!middleDrag) canvas.style.cursor = '';
+});
+
+// ── Toolbar buttons ──
+document.getElementById('btnNew').addEventListener('click', createNote);
+document.getElementById('modeInk').addEventListener('click', () => setMode('ink'));
+document.getElementById('modeType').addEventListener('click', () => setMode('type'));
+
+// ── Export buttons ──
+document.getElementById('btnExportPNG').addEventListener('click', exportPNG);
+document.getElementById('btnExportPDF').addEventListener('click', exportPDF);
+document.getElementById('btnExportTXT').addEventListener('click', exportTXT);
+
+document.getElementById('noteTitleInput').addEventListener('input', debounceSave);
+document.getElementById('noteTextarea').addEventListener('input', debounceSave);
+
+document.getElementById('toolPen').addEventListener('click', () => {
+  isEraser = false;
+  canvas.classList.remove('eraser-mode');
+  document.getElementById('toolPen').classList.add('active');
+  document.getElementById('toolEraser').classList.remove('active');
+});
+
+document.getElementById('toolEraser').addEventListener('click', () => {
+  isEraser = true;
+  canvas.classList.add('eraser-mode');
+  document.getElementById('toolEraser').classList.add('active');
+  document.getElementById('toolPen').classList.remove('active');
+});
+
+document.getElementById('strokeSize').addEventListener('input', e => {
+  strokeWidth = parseInt(e.target.value);
+});
+
+document.getElementById('toolClear').addEventListener('click', () => {
+  if (!confirm('Clear this canvas?')) return;
+  saveSnapshot();
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  debounceSave();
+});
+
+document.getElementById('toolUndo').addEventListener('click', () => {
+  if (undoStack.length < 2) return;
+  undoStack.pop();
+  const prev = undoStack[undoStack.length - 1];
+  const img = new Image();
+  img.onload = () => {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width / (window.devicePixelRatio || 1), canvas.height / (window.devicePixelRatio || 1));
+    debounceSave();
+  };
+  img.src = prev;
+});
+
+// Color swatches
+document.querySelectorAll('.color-swatch').forEach(sw => {
+  sw.addEventListener('click', () => {
+    currentColor = sw.dataset.color;
+    isEraser = false;
+    canvas.classList.remove('eraser-mode');
+    document.getElementById('toolPen').classList.add('active');
+    document.getElementById('toolEraser').classList.remove('active');
+    document.querySelectorAll('.color-swatch').forEach(s => s.classList.remove('active'));
+    sw.classList.add('active');
+    document.getElementById('colorCustom').value = currentColor;
+  });
+});
+
+document.getElementById('colorCustom').addEventListener('input', e => {
+  currentColor = e.target.value;
+  document.querySelectorAll('.color-swatch').forEach(s => s.classList.remove('active'));
+  isEraser = false;
+  canvas.classList.remove('eraser-mode');
+  document.getElementById('toolPen').classList.add('active');
+  document.getElementById('toolEraser').classList.remove('active');
+});
+
+// ── Search ──
+document.getElementById('searchInput').addEventListener('input', e => {
+  searchQuery = e.target.value.toLowerCase();
+  renderList();
+});
+
+// ── Render list ──
+function renderList() {
+  const list = document.getElementById('notesList');
+  const filtered = notes.filter(n => {
+    if (!searchQuery) return true;
+    return (n.title || '').toLowerCase().includes(searchQuery) ||
+           (n.textData || '').toLowerCase().includes(searchQuery);
+  });
+
+  list.innerHTML = filtered.map(n => {
+    // Both layers can hold content independently now — badge reflects
+    // what's actually there, not just which mode happens to be active
+    const hasInk = !!n.inkData;
+    const hasText = !!n.textData;
+    const badgeLabel = hasInk && hasText ? 'ink+text' : (hasText ? 'text' : 'ink');
+    return `
+    <div class="note-item${n.id === activeId ? ' active' : ''}" onclick="selectNote('${n.id}')">
+      <div class="note-item-title">${n.title || 'Untitled'}</div>
+      <div class="note-item-meta">
+        <span class="note-type-badge${hasInk ? ' ink' : ''}">${badgeLabel}</span>
+        ${formatDate(n.updated)}
+      </div>
+      <button class="note-item-delete" onclick="deleteNote('${n.id}', event)" title="Delete">×</button>
+    </div>
+  `;
+  }).join('');
+
+  document.getElementById('noteCount').textContent =
+    `${notes.length} note${notes.length !== 1 ? 's' : ''}`;
+}
+
+function formatDate(ts) {
+  const d = new Date(ts);
+  const now = new Date();
+  if (d.toDateString() === now.toDateString()) {
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+  return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+}
+
+function showEmpty() {
+  document.getElementById('toolbar').style.display = 'none';
+  document.getElementById('noteSurface').style.display = 'none';
+  document.getElementById('emptyState').style.display = 'flex';
+}
+
+// ── Export ──
+
+// Strip characters that aren't safe in a downloaded filename
+function sanitizeFilename(name) {
+  return name.replace(/[\\/:*?"<>|]/g, '-');
+}
+
+// Trigger a browser download for a Blob via a temporary <a download>
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// Briefly show "Exported!" on the save-status span, then restore it
+function flashExported() {
+  setSaveStatus('Exported!');
+  setTimeout(() => setSaveStatus('saved'), 1500);
+}
+
+// Flatten both layers into a single canvas: the ink drawing with the typed
+// text laid on top of it, matching how they're stacked on screen. Used for
+// PNG export so a note's whole content (not just the active layer) is kept.
+function flattenLayers() {
+  const flat = document.createElement('canvas');
+  flat.width = canvas.width;
+  flat.height = canvas.height;
+  const fctx = flat.getContext('2d');
+
+  const vars = getComputedStyle(document.documentElement);
+  const bg = vars.getPropertyValue('--canvas-bg').trim() || '#F0EDE6';
+  const ink = vars.getPropertyValue('--ink').trim() || '#1A1A1A';
+
+  // Paper background, then the ink drawing on top of it
+  fctx.fillStyle = bg;
+  fctx.fillRect(0, 0, flat.width, flat.height);
+  fctx.drawImage(canvas, 0, 0);
+
+  // The typed text, laid out the same way it appears in .note-textarea
+  const text = document.getElementById('noteTextarea').value;
+  if (text) {
+    const dpr = window.devicePixelRatio || 1;
+    const fontSize = 15;
+    const lineHeight = fontSize * 1.8; // matches .note-textarea line-height: 1.8
+    const padX = 48, padY = 40;         // matches .note-textarea padding: 40px 48px
+    const contentWidth = flat.width / dpr - padX * 2;
+    const font = `${fontSize}px 'JetBrains Mono', monospace`;
+
+    fctx.save();
+    fctx.scale(dpr, dpr);
+    fctx.font = font;
+    fctx.fillStyle = ink;
+    fctx.textBaseline = 'top';
+
+    // Word-wrap using the same measuring context we're about to draw with
+    const lines = [];
+    text.split('\n').forEach(rawLine => {
+      if (rawLine === '') { lines.push(''); return; }
+      let current = '';
+      rawLine.split(' ').forEach(word => {
+        const test = current ? current + ' ' + word : word;
+        if (current && fctx.measureText(test).width > contentWidth) {
+          lines.push(current);
+          current = word;
+        } else {
+          current = test;
+        }
+      });
+      lines.push(current);
+    });
+    lines.forEach((line, i) => fctx.fillText(line, padX, padY + i * lineHeight));
+    fctx.restore();
+  }
+
+  return flat;
+}
+
+function exportPNG() {
+  const note = getActive();
+  if (!note) return;
+  const titleVal = document.getElementById('noteTitleInput').value.trim();
+  const filename = sanitizeFilename(titleVal || 'untitled') + '.png';
+
+  flattenLayers().toBlob(blob => {
+    if (blob) { downloadBlob(blob, filename); flashExported(); }
+  }, 'image/png');
+}
+
+// Builds a real downloadable PDF via jsPDF (loaded from CDN in <head>).
+// A4 page size in points: 595 x 842.
+function exportPDF() {
+  const note = getActive();
+  if (!note) return;
+  const titleVal = document.getElementById('noteTitleInput').value.trim();
+  const filename = sanitizeFilename(titleVal || 'untitled') + '.pdf';
+
+  const { jsPDF } = window.jspdf;
+  const pageWidth = 595, pageHeight = 842;
+  const margin = 40;
+  const doc = new jsPDF({ unit: 'pt', format: [pageWidth, pageHeight] });
+
+  // Title header
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(14);
+  doc.text(titleVal || 'Untitled', margin, margin);
+  const contentTop = margin + 20; // below the header
+
+  if (mode === 'ink') {
+    // Ink note: drop the canvas in as a JPEG, scaled to fit the page.
+    // The canvas itself is transparent where nothing is drawn, and JPEG has
+    // no alpha channel, so flatten onto a white background first — otherwise
+    // those areas turn solid black in the exported JPEG.
+    const flat = document.createElement('canvas');
+    flat.width = canvas.width;
+    flat.height = canvas.height;
+    const fctx = flat.getContext('2d');
+    fctx.fillStyle = '#ffffff';
+    fctx.fillRect(0, 0, flat.width, flat.height);
+    fctx.drawImage(canvas, 0, 0);
+    const imgData = flat.toDataURL('image/jpeg', 0.95);
+    const maxWidth = pageWidth - margin * 2;
+    const maxHeight = pageHeight - contentTop - margin;
+    const ratio = Math.min(maxWidth / canvas.width, maxHeight / canvas.height);
+    const imgW = canvas.width * ratio;
+    const imgH = canvas.height * ratio;
+    doc.addImage(imgData, 'JPEG', margin, contentTop, imgW, imgH);
+  } else {
+    // Type note: monospace body text, wrapped to the page width, paginated
+    const text = document.getElementById('noteTextarea').value;
+    doc.setFont('courier', 'normal');
+    doc.setFontSize(11);
+    const lineHeight = 14;
+    const maxWidth = pageWidth - margin * 2;
+    const lines = doc.splitTextToSize(text, maxWidth);
+
+    let y = contentTop + lineHeight;
+    lines.forEach(line => {
+      if (y > pageHeight - margin) {
+        doc.addPage([pageWidth, pageHeight]);
+        y = margin + lineHeight;
+      }
+      doc.text(line, margin, y);
+      y += lineHeight;
+    });
+  }
+
+  doc.save(filename);
+  flashExported();
+}
+
+// Type notes only: download the raw textarea content as a .txt file
+function exportTXT() {
+  const note = getActive();
+  if (!note) return;
+  const titleVal = document.getElementById('noteTitleInput').value.trim();
+  const filename = sanitizeFilename(titleVal || 'untitled') + '.txt';
+
+  const text = document.getElementById('noteTextarea').value;
+  const blob = new Blob([text], { type: 'text/plain' });
+  downloadBlob(blob, filename);
+  flashExported();
+}
+
+// ── Mobile sidebar ──
+document.getElementById('btnMenu').addEventListener('click', () => {
+  document.getElementById('sidebar').classList.toggle('open');
+});
+document.getElementById('main').addEventListener('click', () => {
+  document.getElementById('sidebar').classList.remove('open');
+});
+
+// ── Save before unload ──
+window.addEventListener('beforeunload', saveActiveNote);
+
+// ── Keyboard shortcut ──
+document.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'n') { e.preventDefault(); createNote(); }
+  if ((e.ctrlKey || e.metaKey) && e.key === 'z' && mode === 'ink') {
+    e.preventDefault();
+    document.getElementById('toolUndo').click();
+  }
+});
+
+init();
+</script>
+</body>
+</html>
