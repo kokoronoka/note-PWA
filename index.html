@@ -9,6 +9,7 @@
   <link rel="apple-touch-icon" href="icons/icon-192.png" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-touch-fullscreen" content="yes" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
@@ -49,6 +50,11 @@
       display: flex;
       height: 100vh;
       overflow: hidden;
+      /* Keep content clear of notches / Dynamic Island / home indicator */
+      padding-top: env(safe-area-inset-top);
+      padding-bottom: env(safe-area-inset-bottom);
+      padding-left: env(safe-area-inset-left);
+      padding-right: env(safe-area-inset-right);
     }
 
     /* ── Sidebar ── */
@@ -123,6 +129,15 @@
     }
     .notes-list::-webkit-scrollbar { width: 4px; }
     .notes-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+    /* ── Sidebar drawer backdrop (mobile/tablet only, see media query) ── */
+    .sidebar-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.5);
+      z-index: 15;
+    }
 
     .note-item {
       padding: 12px;
@@ -370,8 +385,23 @@
       display: block;
       touch-action: none;
       cursor: crosshair;
+      /* Promote to its own GPU layer so drawing repaints don't touch
+         sibling/ancestor layers (and vice versa) */
+      will-change: transform;
+      -webkit-transform: translateZ(0);
+      transform: translateZ(0);
     }
     .note-canvas.eraser-mode { cursor: cell; }
+
+    /* Active-stroke scratch canvas (see startDraw/draw/endDraw): overlays
+       #noteCanvas exactly, but never receives input itself — mainCanvas
+       stays the single interactive target throughout */
+    #bufferCanvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      pointer-events: none;
+    }
 
     /* ── Zoom controls (ink mode only, see setMode()) ── */
     .zoom-controls {
@@ -488,7 +518,10 @@
       padding: 4px;
     }
 
-    @media (max-width: 680px) {
+    /* ══ Tablet + Mobile shared (≤768px): drawer sidebar + touch targets ══
+       Desktop (≥769px) is untouched — nothing in this block or below
+       applies above 768px. */
+    @media (max-width: 768px) {
       .sidebar {
         position: fixed;
         top: 0; left: 0; bottom: 0;
@@ -496,10 +529,47 @@
         box-shadow: 4px 0 30px #00000066;
       }
       .sidebar.open { transform: translateX(0); }
+      .sidebar-overlay.open { display: block; }
       .mobile-bar { display: flex; }
       .text-area-wrap { padding: 12px; }
-      .note-textarea { padding: 20px 20px; }
       .toolbar { padding: 8px 12px; gap: 8px; }
+      .toolbar-divider { display: none; }
+
+      /* Stack the toolbar: row 1 = title + mode toggle (default DOM order),
+         row 2 = ink tools, forced onto its own line via flex-basis:100% */
+      .note-title-input { min-width: 80px; }
+      .ink-tools { flex-basis: 100%; }
+
+      /* Comfortable touch targets */
+      .btn-new, .btn-icon, .btn-menu { min-width: 44px; min-height: 44px; }
+      .mode-btn { min-height: 44px; padding: 10px 18px; }
+      .tool-btn { width: 40px; height: 40px; min-width: 40px; min-height: 40px; }
+      .note-item { min-height: 48px; }
+      /* No :hover on touch — keep the delete button visibly tappable instead */
+      .note-item-delete { opacity: 0.4; }
+      .note-item-delete:active { opacity: 1; }
+
+      /* Smaller, less obtrusive zoom controls, tucked closer to the corner */
+      .zoom-controls { right: 8px; bottom: 8px; padding: 2px; gap: 1px; }
+      .zoom-btn { width: 22px; height: 22px; font-size: 13px; }
+      .zoom-label { font-size: 10px; min-width: 30px; }
+    }
+
+    /* ══ Tablet only (481px–768px) ══ */
+    @media (min-width: 481px) and (max-width: 768px) {
+      .sidebar { width: 300px; min-width: 300px; }
+    }
+
+    /* ══ Phone only (≤480px) ══ */
+    @media (max-width: 480px) {
+      .sidebar { width: 100vw; min-width: 100vw; }
+      .note-textarea { padding: 20px 16px; }
+      .save-status { display: none; }
+      .stroke-size input[type=range] { width: 60px; }
+      /* Fewer swatches to save space — black, blue, red + custom picker */
+      .color-swatch[data-color="#2DB85B"],
+      .color-swatch[data-color="#9B2DE3"] { display: none; }
+      .empty-state { padding: 0 24px; text-align: center; }
     }
 
     /* fade-in on note switch */
@@ -522,6 +592,9 @@
     <div class="notes-list" id="notesList"></div>
     <div class="sidebar-footer" id="noteCount">0 notes</div>
   </aside>
+
+  <!-- Backdrop shown behind the sidebar drawer on mobile/tablet -->
+  <div class="sidebar-overlay" id="sidebarOverlay"></div>
 
   <!-- Main -->
   <div class="main" id="main">
@@ -600,6 +673,7 @@
       <div class="canvas-wrap" id="canvasWrap">
         <div id="canvasTransformWrap">
           <canvas class="note-canvas" id="noteCanvas"></canvas>
+          <canvas class="note-canvas" id="bufferCanvas" style="display:none"></canvas>
         </div>
         <!-- Zoom controls: ink mode only, see setMode() -->
         <div class="zoom-controls" id="zoomControls">
@@ -634,7 +708,9 @@ let searchQuery = '';
 // The canvas is a large fixed-size page; zoom/pan are a CSS transform on
 // #canvasTransformWrap, independent of the canvas's own pixel content (so
 // undo/redo — which only touches canvas pixels — never affects them).
-const CANVAS_W = 3000, CANVAS_H = 2000;
+// Logical size and device-pixel-ratio are picked once at startup based on
+// the viewport, so mobile GPUs aren't pushed a 6000x4000+ backing store.
+let CANVAS_W, CANVAS_H, DPR;
 const MIN_ZOOM = 0.3, MAX_ZOOM = 5.0;
 let zoom = 1, panX = 0, panY = 0;
 const activeTouches = new Map(); // pointerId -> {x, y} in canvasWrap-local space
@@ -643,6 +719,17 @@ let middleDrag = null;           // { startX, startY, startPanX, startPanY } whi
 
 const canvas = document.getElementById('noteCanvas');
 const ctx = canvas.getContext('2d');
+
+// Scratch canvas for the currently-active stroke (see startDraw/draw/endDraw)
+const bufferCanvas = document.getElementById('bufferCanvas');
+const bufferCtx = bufferCanvas.getContext('2d');
+
+// Scratch canvas used only to downscale undo snapshots (see saveSnapshot)
+const undoCanvas = document.createElement('canvas');
+const undoCtx = undoCanvas.getContext('2d');
+
+// rAF batching for pointermove: only one canvas update per animation frame
+let rafPending = false, rafHandle = null, lastMoveEvent = null;
 
 // ── Init ──
 function init() {
@@ -705,7 +792,11 @@ function saveNotes() {
 function getActive() { return notes.find(n => n.id === activeId); }
 
 // ── Save current note state ──
-function saveActiveNote() {
+// immediate=true skips the yield-then-encode optimization below and encodes
+// synchronously instead — required whenever the canvas is about to be
+// cleared/reused right after this call returns (switching notes) or the
+// page is about to unload (a deferred setTimeout may never get to run).
+function saveActiveNote(immediate = false) {
   const note = getActive();
   if (!note) return;
   note.title = document.getElementById('noteTitleInput').value;
@@ -715,11 +806,29 @@ function saveActiveNote() {
   note.panX = panX;
   note.panY = panY;
   if (mode === 'ink') {
-    note.inkData = canvas.toDataURL();
+    const encode = () => {
+      // JPEG instead of PNG: 3-5x smaller (faster to encode/decode, less
+      // localStorage used) — quality 0.85 is visually indistinguishable for
+      // handwritten notes. Loading it back works the same way (img.src).
+      // JPEG has no alpha channel though, and the canvas is transparent
+      // wherever nothing's drawn — flatten onto the paper background first,
+      // or every undrawn area would be saved (and reloaded) as solid black.
+      const flat = document.createElement('canvas');
+      flat.width = canvas.width;
+      flat.height = canvas.height;
+      const fctx = flat.getContext('2d');
+      fctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--canvas-bg').trim() || '#F0EDE6';
+      fctx.fillRect(0, 0, flat.width, flat.height);
+      fctx.drawImage(canvas, 0, 0);
+      note.inkData = flat.toDataURL('image/jpeg', 0.85);
+      saveNotes();
+    };
+    if (immediate) encode();
+    else setTimeout(encode, 0); // yield to the browser before the (blocking) encode
   } else {
     note.textData = document.getElementById('noteTextarea').value;
+    saveNotes();
   }
-  saveNotes();
   setSaveStatus('saved');
   renderList();
 }
@@ -727,7 +836,8 @@ function saveActiveNote() {
 function debounceSave() {
   setSaveStatus('saving…');
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(saveActiveNote, 800);
+  const delay = window.innerWidth <= 768 ? 2000 : 800;
+  saveTimer = setTimeout(saveActiveNote, delay);
 }
 
 function setSaveStatus(txt) {
@@ -737,11 +847,18 @@ function setSaveStatus(txt) {
 // ── Select Note ──
 function selectNote(id) {
   // Save previous
-  if (activeId && activeId !== id) saveActiveNote();
+  // immediate=true: the canvas gets cleared/reused for the incoming note a
+  // few lines below, so the outgoing note's ink must be captured synchronously
+  if (activeId && activeId !== id) saveActiveNote(true);
 
   activeId = id;
   const note = getActive();
   if (!note) return;
+
+  // On mobile/tablet the sidebar is a drawer over the note — close it once
+  // a note is picked so the note is immediately visible (harmless no-op on
+  // desktop, where the sidebar is never given the 'open' class)
+  closeSidebar();
 
   // Show toolbar + note surface
   document.getElementById('emptyState').style.display = 'none';
@@ -770,7 +887,12 @@ function selectNote(id) {
     const img = new Image();
     img.onload = () => {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(img, 0, 0);
+      // Explicit destination size: ctx already has scale(DPR,DPR) applied,
+      // and img's native size is the physical (DPR-multiplied) pixel size,
+      // so drawImage(img,0,0) with no destination size would double-scale
+      // it — rendering only the top-left quarter of the saved drawing on
+      // any DPR>1 device (i.e. virtually every phone).
+      ctx.drawImage(img, 0, 0, CANVAS_W, CANVAS_H);
       saveSnapshot();
     };
     img.src = note.inkData;
@@ -808,22 +930,65 @@ function setMode(m, save = true) {
 }
 
 // ── Canvas ──
+// Logical page size depends on the viewport at load time: full 3000x2000 on
+// desktop, smaller on mobile/tablet so the backing store (size x DPR) stays
+// within what mobile GPUs can push around comfortably.
+function getCanvasDims() {
+  const w = window.innerWidth;
+  if (w <= 480) return { w: 1500, h: 1000 };
+  if (w <= 768) return { w: 2000, h: 1400 };
+  return { w: 3000, h: 2000 };
+}
+
 // The canvas is a fixed-size logical page (CANVAS_W x CANVAS_H), sized once.
 // Zoom/pan never touch these dimensions — they only move the CSS transform.
 function initCanvasSize() {
-  const dpr = window.devicePixelRatio || 1;
-  canvas.style.width = CANVAS_W + 'px';
-  canvas.style.height = CANVAS_H + 'px';
-  canvas.width = CANVAS_W * dpr;
-  canvas.height = CANVAS_H * dpr;
-  ctx.scale(dpr, dpr);
-  ctx.lineCap = 'round';
-  ctx.lineJoin = 'round';
+  const dims = getCanvasDims();
+  CANVAS_W = dims.w;
+  CANVAS_H = dims.h;
+  DPR = Math.min(window.devicePixelRatio || 1, 2); // cap regardless of actual screen density
+
+  [canvas, bufferCanvas].forEach(c => {
+    c.style.width = CANVAS_W + 'px';
+    c.style.height = CANVAS_H + 'px';
+    c.width = CANVAS_W * DPR;
+    c.height = CANVAS_H * DPR;
+  });
+  [ctx, bufferCtx].forEach(c => {
+    c.scale(DPR, DPR);
+    c.lineCap = 'round';
+    c.lineJoin = 'round';
+  });
+
+  // Undo snapshots are captured at 1x (logical) resolution rather than the
+  // full DPR-scaled backing store. Raw ImageData at, say, 6000x4000 (desktop
+  // at DPR 2) is 96MB PER SNAPSHOT — 20 of those is ~1.9GB, which is more
+  // memory than the old toDataURL() approach ever used (500KB-2MB each),
+  // not less. Downscaling to logical size keeps snapshots fast to capture
+  // (still no PNG encode/decode) while keeping total memory sane.
+  undoCanvas.width = CANVAS_W;
+  undoCanvas.height = CANVAS_H;
+}
+
+// Mobile/tablet keep fewer, smaller undo steps than desktop (see comment
+// in initCanvasSize about why full-resolution ImageData isn't used here).
+function undoLimit() {
+  return window.innerWidth <= 768 ? 10 : 20;
 }
 
 function saveSnapshot() {
-  undoStack.push(canvas.toDataURL());
-  if (undoStack.length > 30) undoStack.shift();
+  undoCtx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+  undoCtx.drawImage(canvas, 0, 0, CANVAS_W, CANVAS_H); // downscale from the DPR-scaled main canvas
+  undoStack.push(undoCtx.getImageData(0, 0, CANVAS_W, CANVAS_H));
+  if (undoStack.length > undoLimit()) undoStack.shift();
+}
+
+// Paints a saved undo snapshot back onto the main canvas, upscaling from
+// the logical-resolution snapshot to the canvas's full DPR-scaled size.
+function restoreSnapshot(imageData) {
+  undoCtx.putImageData(imageData, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(undoCanvas, 0, 0, CANVAS_W, CANVAS_H);
 }
 
 // ── Zoom & pan ──
@@ -924,32 +1089,39 @@ function getPos(e) {
   return { x: c.x, y: c.y, pressure: e.pressure !== undefined && e.pressure > 0 ? e.pressure : 0.5 };
 }
 
+// The active stroke is drawn on bufferCanvas, not the main canvas — this
+// avoids reading from and writing to the same (GPU-composited, will-change)
+// canvas simultaneously, which stalls the render pipeline on mobile GPUs.
 function startDraw(e) {
   e.preventDefault();
   const pos = getPos(e);
   drawing = true;
   lastX = pos.x;
   lastY = pos.y;
-  ctx.beginPath();
-  ctx.moveTo(lastX, lastY);
-  saveSnapshot();
+
+  bufferCtx.clearRect(0, 0, bufferCanvas.width, bufferCanvas.height);
+  bufferCtx.drawImage(canvas, 0, 0, CANVAS_W, CANVAS_H); // seed with the committed content
+  bufferCanvas.style.display = 'block';
+
+  bufferCtx.beginPath();
+  bufferCtx.moveTo(lastX, lastY);
+  saveSnapshot(); // captures the main canvas's pre-stroke state, untouched by the above
 }
 
 function draw(e) {
   if (!drawing) return;
-  e.preventDefault();
   const pos = getPos(e);
   const pressure = pos.pressure > 0 ? pos.pressure : 0.5;
   const dynamicWidth = isEraser ? 20 : strokeWidth * (0.5 + pressure * 1.2);
 
-  ctx.globalCompositeOperation = isEraser ? 'destination-out' : 'source-over';
-  ctx.strokeStyle = isEraser ? 'rgba(0,0,0,1)' : currentColor;
-  ctx.lineWidth = dynamicWidth;
+  bufferCtx.globalCompositeOperation = isEraser ? 'destination-out' : 'source-over';
+  bufferCtx.strokeStyle = isEraser ? 'rgba(0,0,0,1)' : currentColor;
+  bufferCtx.lineWidth = dynamicWidth;
 
-  ctx.lineTo(pos.x, pos.y);
-  ctx.stroke();
-  ctx.beginPath();
-  ctx.moveTo(pos.x, pos.y);
+  bufferCtx.lineTo(pos.x, pos.y);
+  bufferCtx.stroke();
+  bufferCtx.beginPath();
+  bufferCtx.moveTo(pos.x, pos.y);
 
   lastX = pos.x;
   lastY = pos.y;
@@ -959,7 +1131,11 @@ function draw(e) {
 function endDraw(e) {
   if (!drawing) return;
   drawing = false;
-  ctx.globalCompositeOperation = 'source-over';
+  bufferCtx.globalCompositeOperation = 'source-over';
+
+  // Commit the finished stroke onto the main canvas in one shot, then hide the buffer
+  ctx.drawImage(bufferCanvas, 0, 0, CANVAS_W, CANVAS_H);
+  bufferCanvas.style.display = 'none';
 }
 
 // Pointer events handle all three input kinds. Touch is tracked separately
@@ -994,22 +1170,32 @@ canvas.addEventListener('pointerdown', e => {
   startDraw(e);
 }, { passive: false });
 
-canvas.addEventListener('pointermove', e => {
-  if (e.pointerType === 'touch' && activeTouches.has(e.pointerId)) {
-    activeTouches.set(e.pointerId, wrapPoint(e));
+// Batches fast-firing pointermove events into at most one canvas/transform
+// update per animation frame, instead of one per event (which fires faster
+// than the screen refreshes). preventDefault() must stay in the synchronous
+// listener below — it has no effect once called from this deferred callback.
+function processPointerMove() {
+  rafPending = false;
+  rafHandle = null;
+  const e = lastMoveEvent;
+  lastMoveEvent = null;
+  if (!e) return;
+
+  if (e.pointerType === 'touch') {
     if (activeTouches.size >= 2 && pinch) {
-      e.preventDefault();
       updatePinch();
       debounceSave();
     } else if (activeTouches.size === 1 && drawing) {
-      e.preventDefault();
-      draw(e);
+      // Replay every point sampled since the last frame (if the browser
+      // coalesced several into this one event) for a fully-sampled line,
+      // while still only touching the canvas once per rendered frame
+      const events = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
+      (events.length ? events : [e]).forEach(draw);
     }
     return;
   }
 
   if (middleDrag) {
-    e.preventDefault();
     panX = middleDrag.startPanX + (e.clientX - middleDrag.startX);
     panY = middleDrag.startPanY + (e.clientY - middleDrag.startY);
     applyTransform();
@@ -1017,10 +1203,43 @@ canvas.addEventListener('pointermove', e => {
     return;
   }
 
-  draw(e);
+  const events = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
+  (events.length ? events : [e]).forEach(draw);
+}
+
+function scheduleMove(e) {
+  lastMoveEvent = e;
+  if (!rafPending) {
+    rafPending = true;
+    rafHandle = requestAnimationFrame(processPointerMove);
+  }
+}
+
+// Applies any move batched for the next frame right now — called before a
+// gesture ends, so the final segment before pointerup is never dropped.
+function flushPendingMove() {
+  if (rafPending) {
+    cancelAnimationFrame(rafHandle);
+    processPointerMove();
+  }
+}
+
+canvas.addEventListener('pointermove', e => {
+  if (e.pointerType === 'touch' && activeTouches.has(e.pointerId)) {
+    activeTouches.set(e.pointerId, wrapPoint(e));
+    if ((activeTouches.size >= 2 && pinch) || (activeTouches.size === 1 && drawing)) {
+      e.preventDefault();
+    }
+    scheduleMove(e);
+    return;
+  }
+
+  if (middleDrag || drawing) e.preventDefault();
+  scheduleMove(e);
 }, { passive: false });
 
 function releasePointer(e) {
+  flushPendingMove();
   if (e.pointerType === 'touch') {
     activeTouches.delete(e.pointerId);
     if (activeTouches.size < 2) pinch = null;
@@ -1117,16 +1336,13 @@ document.getElementById('toolClear').addEventListener('click', () => {
 });
 
 document.getElementById('toolUndo').addEventListener('click', () => {
-  if (undoStack.length < 2) return;
+  // saveSnapshot() pushes the pre-stroke state at the start of every stroke,
+  // so the top of the stack IS the correct "undo the last stroke" target —
+  // restore it, then discard it so the next undo goes one step further back.
+  if (!undoStack.length) return;
+  restoreSnapshot(undoStack[undoStack.length - 1]);
   undoStack.pop();
-  const prev = undoStack[undoStack.length - 1];
-  const img = new Image();
-  img.onload = () => {
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.drawImage(img, 0, 0, canvas.width / (window.devicePixelRatio || 1), canvas.height / (window.devicePixelRatio || 1));
-    debounceSave();
-  };
-  img.src = prev;
+  debounceSave();
 });
 
 // Color swatches
@@ -1250,15 +1466,16 @@ function flattenLayers() {
   // The typed text, laid out the same way it appears in .note-textarea
   const text = document.getElementById('noteTextarea').value;
   if (text) {
-    const dpr = window.devicePixelRatio || 1;
+    // Use the same (possibly capped) DPR the canvas itself was scaled with —
+    // not the raw device value, which may be higher than what was applied
     const fontSize = 15;
     const lineHeight = fontSize * 1.8; // matches .note-textarea line-height: 1.8
     const padX = 48, padY = 40;         // matches .note-textarea padding: 40px 48px
-    const contentWidth = flat.width / dpr - padX * 2;
+    const contentWidth = flat.width / DPR - padX * 2;
     const font = `${fontSize}px 'JetBrains Mono', monospace`;
 
     fctx.save();
-    fctx.scale(dpr, dpr);
+    fctx.scale(DPR, DPR);
     fctx.font = font;
     fctx.fillStyle = ink;
     fctx.textBaseline = 'top';
@@ -1373,15 +1590,24 @@ function exportTXT() {
 }
 
 // ── Mobile sidebar ──
-document.getElementById('btnMenu').addEventListener('click', () => {
-  document.getElementById('sidebar').classList.toggle('open');
-});
-document.getElementById('main').addEventListener('click', () => {
+function closeSidebar() {
   document.getElementById('sidebar').classList.remove('open');
+  document.getElementById('sidebarOverlay').classList.remove('open');
+}
+document.getElementById('btnMenu').addEventListener('click', e => {
+  // btnMenu lives inside #main, so its click would otherwise bubble into
+  // #main's own listener below and immediately re-close what this just opened
+  e.stopPropagation();
+  document.getElementById('sidebar').classList.toggle('open');
+  document.getElementById('sidebarOverlay').classList.toggle('open');
 });
+document.getElementById('sidebarOverlay').addEventListener('click', closeSidebar);
+document.getElementById('main').addEventListener('click', closeSidebar);
 
 // ── Save before unload ──
-window.addEventListener('beforeunload', saveActiveNote);
+// immediate=true: a deferred setTimeout(0) encode may never get to run before
+// the page actually unloads, so this must encode synchronously
+window.addEventListener('beforeunload', () => saveActiveNote(true));
 
 // ── Keyboard shortcut ──
 document.addEventListener('keydown', e => {
