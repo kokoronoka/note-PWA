@@ -1584,7 +1584,14 @@ function endDraw(e) {
   drawing = false;
   bufferCtx.globalCompositeOperation = 'source-over';
 
-  // Commit the finished stroke onto the main canvas in one shot, then hide the buffer
+  // Commit the finished stroke onto the main canvas. Must clear first: under
+  // source-over, a fully-transparent source pixel leaves the destination
+  // pixel completely untouched — so an eraser hole punched into the buffer
+  // would silently vanish on commit, leaving the old (un-erased) pixel on
+  // the main canvas in place, if the stale content underneath weren't wiped
+  // out before drawing the buffer's actual final state on top of it.
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.drawImage(bufferCanvas, 0, 0, CANVAS_W, CANVAS_H);
   bufferCanvas.style.display = 'none';
 }
@@ -1765,9 +1772,35 @@ document.getElementById('noteTextarea').addEventListener('input', () => {
   debounceSave();
 });
 
+// Shows a circular outline at the eraser's actual size while it's active,
+// in place of the generic 'cell' cursor. Sized off the same fixed 20px
+// width draw() actually uses for the eraser (see dynamicWidth) — the
+// stroke-size slider only ever affects the pen, not the eraser, so this
+// deliberately does not track it.
+function updateEraserCursor() {
+  if (!isEraser) {
+    canvas.style.cursor = '';
+    return;
+  }
+  const ERASER_WIDTH = 20;
+  const size = Math.max(ERASER_WIDTH, 8);
+  const cursorCanvas = document.createElement('canvas');
+  cursorCanvas.width = size + 4;
+  cursorCanvas.height = size + 4;
+  const c = cursorCanvas.getContext('2d');
+  c.beginPath();
+  c.arc(size / 2 + 2, size / 2 + 2, size / 2, 0, Math.PI * 2);
+  c.strokeStyle = '#555';
+  c.lineWidth = 1.5;
+  c.stroke();
+  const url = cursorCanvas.toDataURL();
+  canvas.style.cursor = `url(${url}) ${size / 2 + 2} ${size / 2 + 2}, cell`;
+}
+
 document.getElementById('toolPen').addEventListener('click', () => {
   isEraser = false;
   canvas.classList.remove('eraser-mode');
+  updateEraserCursor();
   document.getElementById('toolPen').classList.add('active');
   document.getElementById('toolEraser').classList.remove('active');
 });
@@ -1775,6 +1808,7 @@ document.getElementById('toolPen').addEventListener('click', () => {
 document.getElementById('toolEraser').addEventListener('click', () => {
   isEraser = true;
   canvas.classList.add('eraser-mode');
+  updateEraserCursor();
   document.getElementById('toolEraser').classList.add('active');
   document.getElementById('toolPen').classList.remove('active');
 });
@@ -1806,6 +1840,7 @@ document.querySelectorAll('.color-swatch').forEach(sw => {
     currentColor = sw.dataset.color;
     isEraser = false;
     canvas.classList.remove('eraser-mode');
+    updateEraserCursor();
     document.getElementById('toolPen').classList.add('active');
     document.getElementById('toolEraser').classList.remove('active');
     document.querySelectorAll('.color-swatch').forEach(s => s.classList.remove('active'));
@@ -1819,6 +1854,7 @@ document.getElementById('colorCustom').addEventListener('input', e => {
   document.querySelectorAll('.color-swatch').forEach(s => s.classList.remove('active'));
   isEraser = false;
   canvas.classList.remove('eraser-mode');
+  updateEraserCursor();
   document.getElementById('toolPen').classList.add('active');
   document.getElementById('toolEraser').classList.remove('active');
 });
