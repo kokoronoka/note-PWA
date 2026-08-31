@@ -368,6 +368,20 @@
     }
     .btn-signout:hover { color: var(--danger); background: var(--surface2); }
 
+    .sync-status { display: flex; align-items: center; }
+    #syncDot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      display: inline-block;
+      margin-right: 6px;
+      background: var(--text-muted); /* default: grey = connecting */
+      transition: background 0.3s;
+      flex-shrink: 0;
+    }
+    #syncDot.connected { background: #2DB85B; } /* green = live */
+    #syncDot.error { background: var(--danger); } /* red = disconnected */
+
     /* ── Main ── */
     .main {
       flex: 1;
@@ -785,7 +799,10 @@
     </div>
     <div class="notes-list" id="notesList"></div>
     <div class="sidebar-footer">
-      <span id="noteCount">0 notes</span>
+      <span class="sync-status">
+        <span id="syncDot" title="Sync status"></span>
+        <span id="noteCount">0 notes</span>
+      </span>
       <button class="btn-signout" id="btnSignOut" title="Sign out">Sign out</button>
     </div>
   </aside>
@@ -965,6 +982,11 @@ let undoStack = [];
 let saveTimer = null;
 let searchQuery = '';
 
+// ── Realtime sync state ──
+let realtimeChannel = null;
+let userIsTyping = false;
+let typingTimer = null;
+
 // ── Zoom & pan state ──
 // The canvas is a large fixed-size page; zoom/pan are a CSS transform on
 // #canvasTransformWrap, independent of the canvas's own pixel content (so
@@ -1016,6 +1038,7 @@ async function initApp() {
   renderList();
   if (notes.length === 0) createNote();
   else selectNote(notes[0].id);
+  subscribeToRealtime();
 }
 
 function showLoadingState(msg) {
@@ -1024,6 +1047,116 @@ function showLoadingState(msg) {
 }
 function hideLoadingState() {
   document.getElementById('loadingOverlay').style.display = 'none';
+}
+
+// ── Realtime sync (Phase 3) ──
+// Subscribes to postgres_changes on this user's own notes rows so edits on
+// other devices show up here without a refresh. Purely additive: if it
+// fails to connect (offline, project paused, realtime not enabled on the
+// table yet, etc.) the app keeps working exactly as it did in Phase 2.
+async function subscribeToRealtime() {
+  try {
+    const user = await getCurrentUser();
+    if (!user) return;
+
+    realtimeChannel = supabaseClient
+      .channel('notes-sync')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'notes', filter: `user_id=eq.${user.id}` },
+        handleRealtimeChange
+      )
+      .subscribe(status => {
+        console.log('Realtime status:', status); // TODO: remove once sync is confirmed working
+        const dot = document.getElementById('syncDot');
+        if (!dot) return;
+        if (status === 'SUBSCRIBED') dot.className = 'connected';
+        else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') dot.className = 'error';
+        else dot.className = '';
+      });
+  } catch (err) {
+    console.error('Realtime subscribe failed:', err);
+  }
+}
+
+function handleRealtimeChange(payload) {
+  const { eventType, new: newRecord, old: oldRecord } = payload;
+
+  if (eventType === 'INSERT') {
+    // Another device created a note — only add if we don't already have it
+    // (also covers this same device's own insert echoing back to itself)
+    const exists = notes.find(n => n.id === newRecord.id);
+    if (!exists) {
+      const note = mapCloudNoteToLocal(newRecord);
+      notes.unshift(note);
+      saveNotesLocal();
+      renderList();
+      // Do not auto-switch to this note — the user may be busy elsewhere
+    }
+  }
+
+  if (eventType === 'UPDATE') {
+    const index = notes.findIndex(n => n.id === newRecord.id);
+    if (index === -1) return;
+
+    const updatedNote = mapCloudNoteToLocal(newRecord);
+
+    if (activeId !== newRecord.id) {
+      // Not the note currently open — always safe to update quietly
+      notes[index] = updatedNote;
+      saveNotesLocal();
+      renderList();
+      return;
+    }
+
+    // It IS the active note — only touch it while the user is idle, so a
+    // remote edit (or this device's own save echoing back) never interrupts
+    // an in-progress stroke or keystroke. If they're active, their local
+    // version simply wins and overwrites this on the next save.
+    if (!drawing && !userIsTyping) {
+      notes[index] = updatedNote;
+      saveNotesLocal();
+      reloadActiveNoteContent(updatedNote);
+      renderList();
+    }
+  }
+
+  if (eventType === 'DELETE') {
+    const deletedId = oldRecord.id;
+    notes = notes.filter(n => n.id !== deletedId);
+    saveNotesLocal();
+    renderList();
+    if (activeId === deletedId) {
+      activeId = null;
+      if (notes.length > 0) selectNote(notes[0].id);
+      else showEmpty();
+    }
+  }
+}
+
+// Applies a remote update to the currently-open note without disturbing
+// whatever the user is focused on (title/textarea keep their live value if
+// the user is currently in that field).
+function reloadActiveNoteContent(note) {
+  if (document.activeElement !== document.getElementById('noteTitleInput')) {
+    document.getElementById('noteTitleInput').value = note.title || '';
+  }
+
+  if (note.type === 'ink' && note.inkData) {
+    const img = new Image();
+    img.onload = () => {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      // Explicit logical destination size: ctx already has scale(DPR,DPR)
+      // applied, so drawing at the image's native (DPR-multiplied) pixel
+      // size with no destination size would double-scale it.
+      ctx.drawImage(img, 0, 0, CANVAS_W, CANVAS_H);
+    };
+    img.src = note.inkData;
+  }
+
+  if (note.type === 'type' && document.activeElement !== document.getElementById('noteTextarea')) {
+    document.getElementById('noteTextarea').value = note.textData || '';
+  }
 }
 
 // ── Service Worker ──
@@ -1074,6 +1207,8 @@ function deleteNote(id, e) {
 function saveNotes() {
   localStorage.setItem('inkpad_notes', JSON.stringify(notes));
 }
+// Alias used by the realtime sync code below — same function, not a copy.
+const saveNotesLocal = saveNotes;
 
 function getActive() { return notes.find(n => n.id === activeId); }
 
@@ -1599,7 +1734,12 @@ document.getElementById('btnExportPDF').addEventListener('click', exportPDF);
 document.getElementById('btnExportTXT').addEventListener('click', exportTXT);
 
 document.getElementById('noteTitleInput').addEventListener('input', debounceSave);
-document.getElementById('noteTextarea').addEventListener('input', debounceSave);
+document.getElementById('noteTextarea').addEventListener('input', () => {
+  userIsTyping = true;
+  clearTimeout(typingTimer);
+  typingTimer = setTimeout(() => { userIsTyping = false; }, 2000);
+  debounceSave();
+});
 
 document.getElementById('toolPen').addEventListener('click', () => {
   isEraser = false;
@@ -2028,6 +2168,10 @@ document.getElementById('authPassword').addEventListener('keydown', e => {
 });
 
 document.getElementById('btnSignOut').addEventListener('click', async () => {
+  if (realtimeChannel) {
+    supabaseClient.removeChannel(realtimeChannel);
+    realtimeChannel = null;
+  }
   const { error } = await supabaseClient.auth.signOut();
   console.log('signOut:', error); // TODO: remove once auth is confirmed working
   // onAuthStateChange below handles clearing notes and showing the auth screen
@@ -2036,6 +2180,13 @@ document.getElementById('btnSignOut').addEventListener('click', async () => {
 supabaseClient.auth.onAuthStateChange((event, session) => {
   console.log('onAuthStateChange:', event, session); // TODO: remove once auth is confirmed working
   if (event === 'SIGNED_OUT') {
+    // Redundant with the click handler above for a manual sign-out, but this
+    // is the only cleanup that runs for a session expiring on its own
+    if (realtimeChannel) {
+      supabaseClient.removeChannel(realtimeChannel);
+      realtimeChannel = null;
+    }
+    document.getElementById('syncDot').className = '';
     localStorage.removeItem('inkpad_notes');
     notes = [];
     activeId = null;
