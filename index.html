@@ -986,6 +986,10 @@ let searchQuery = '';
 let realtimeChannel = null;
 let userIsTyping = false;
 let typingTimer = null;
+// True for a brief window around selectNote() switching notes, so an
+// incoming realtime UPDATE for the note being switched to/from can't land
+// mid-transition (see handleRealtimeChange's UPDATE branch).
+let isSwitchingNote = false;
 
 // ── Zoom & pan state ──
 // The canvas is a large fixed-size page; zoom/pan are a CSS transform on
@@ -1054,20 +1058,18 @@ function hideLoadingState() {
 // other devices show up here without a refresh. Purely additive: if it
 // fails to connect (offline, project paused, realtime not enabled on the
 // table yet, etc.) the app keeps working exactly as it did in Phase 2.
-async function subscribeToRealtime() {
+function subscribeToRealtime() {
+  if (!currentUser) return; // currentUser is set by checkSession()/onAuthStateChange
+                              // before bootApp() ever reaches initApp() — see Auth section
   try {
-    const user = await getCurrentUser();
-    if (!user) return;
-
     realtimeChannel = supabaseClient
       .channel('notes-sync')
       .on(
         'postgres_changes',
-        { event: '*', schema: 'public', table: 'notes', filter: `user_id=eq.${user.id}` },
+        { event: '*', schema: 'public', table: 'notes', filter: `user_id=eq.${currentUser.id}` },
         handleRealtimeChange
       )
       .subscribe(status => {
-        console.log('Realtime status:', status); // TODO: remove once sync is confirmed working
         const dot = document.getElementById('syncDot');
         if (!dot) return;
         if (status === 'SUBSCRIBED') dot.className = 'connected';
@@ -1099,6 +1101,13 @@ function handleRealtimeChange(payload) {
     const index = notes.findIndex(n => n.id === newRecord.id);
     if (index === -1) return;
 
+    // Guard against a delayed/out-of-order echo overwriting a newer local
+    // edit that either hasn't finished upserting yet or raced ahead of it
+    const localNote = notes[index];
+    const cloudUpdated = new Date(newRecord.updated_at).getTime();
+    const localUpdated = localNote.updated || 0;
+    if (cloudUpdated <= localUpdated) return; // stale/out-of-order — local is already current
+
     const updatedNote = mapCloudNoteToLocal(newRecord);
 
     if (activeId !== newRecord.id) {
@@ -1109,10 +1118,15 @@ function handleRealtimeChange(payload) {
       return;
     }
 
-    // It IS the active note — only touch it while the user is idle, so a
-    // remote edit (or this device's own save echoing back) never interrupts
-    // an in-progress stroke or keystroke. If they're active, their local
-    // version simply wins and overwrites this on the next save.
+    // It IS the active note. First, don't let an update land mid-switch —
+    // selectNote() is still synchronously (or via its pending async ink
+    // load) settling this exact note into a known state.
+    if (isSwitchingNote) return; // note switch in progress — let it finish first
+
+    // Only touch it while the user is idle, so a remote edit (or this
+    // device's own save echoing back) never interrupts an in-progress
+    // stroke or keystroke. If they're active, their local version simply
+    // wins and overwrites this on the next save.
     if (!drawing && !userIsTyping) {
       notes[index] = updatedNote;
       saveNotesLocal();
@@ -1150,6 +1164,9 @@ function reloadActiveNoteContent(note) {
       // applied, so drawing at the image's native (DPR-multiplied) pixel
       // size with no destination size would double-scale it.
       ctx.drawImage(img, 0, 0, CANVAS_W, CANVAS_H);
+      // Without this, undo's stack still points at pre-sync content — the
+      // canvas visibly changed but undo would have no matching entry for it.
+      saveSnapshot();
     };
     img.src = note.inkData;
   }
@@ -1271,6 +1288,8 @@ function setSaveStatus(txt) {
 
 // ── Select Note ──
 function selectNote(id) {
+  isSwitchingNote = true;
+
   // Save previous
   // immediate=true: the canvas gets cleared/reused for the incoming note a
   // few lines below, so the outgoing note's ink must be captured synchronously
@@ -1325,6 +1344,11 @@ function selectNote(id) {
 
   setSaveStatus('saved');
   renderList();
+
+  // Held a little past the synchronous work above since the ink image load
+  // (if any) finishes asynchronously — give it room to land before realtime
+  // updates for this note are allowed through again.
+  setTimeout(() => { isSwitchingNote = false; }, 500);
 }
 
 // ── Mode Switch ──
@@ -2123,11 +2147,9 @@ async function handleSignIn() {
   setAuthLoading(true, 'signin');
   try {
     const { data, error } = await supabaseClient.auth.signInWithPassword({ email, password });
-    console.log('signInWithPassword:', data, error); // TODO: remove once auth is confirmed working
     if (error) { setAuthError(mapAuthError(error)); return; }
     // onAuthStateChange below fires SIGNED_IN and boots the app from there
   } catch (err) {
-    console.log('signInWithPassword threw:', err); // TODO: remove once auth is confirmed working
     setAuthError('Connection failed — check your internet connection and try again');
   } finally {
     setAuthLoading(false);
@@ -2144,7 +2166,6 @@ async function handleSignUp() {
   setAuthLoading(true, 'signup');
   try {
     const { data, error } = await supabaseClient.auth.signUp({ email, password });
-    console.log('signUp:', data, error); // TODO: remove once auth is confirmed working
     if (error) { setAuthError(mapAuthError(error)); return; }
     if (data && data.session) {
       // Email confirmation is off for this project — signUp already
@@ -2154,7 +2175,6 @@ async function handleSignUp() {
       setAuthMessage('Check your email to confirm your account.');
     }
   } catch (err) {
-    console.log('signUp threw:', err); // TODO: remove once auth is confirmed working
     setAuthError('Connection failed — check your internet connection and try again');
   } finally {
     setAuthLoading(false);
@@ -2172,13 +2192,15 @@ document.getElementById('btnSignOut').addEventListener('click', async () => {
     supabaseClient.removeChannel(realtimeChannel);
     realtimeChannel = null;
   }
-  const { error } = await supabaseClient.auth.signOut();
-  console.log('signOut:', error); // TODO: remove once auth is confirmed working
+  await supabaseClient.auth.signOut();
   // onAuthStateChange below handles clearing notes and showing the auth screen
 });
 
 supabaseClient.auth.onAuthStateChange((event, session) => {
-  console.log('onAuthStateChange:', event, session); // TODO: remove once auth is confirmed working
+  // Kept in sync on every auth event (including the INITIAL_SESSION one
+  // fired as soon as this listener is registered) — see db.js's currentUser
+  // for why this replaced calling getUser() fresh on every cloud operation.
+  currentUser = session?.user ?? null;
   if (event === 'SIGNED_OUT') {
     // Redundant with the click handler above for a manual sign-out, but this
     // is the only cleanup that runs for a session expiring on its own
@@ -2200,8 +2222,11 @@ supabaseClient.auth.onAuthStateChange((event, session) => {
 });
 
 async function checkSession() {
-  const { data, error } = await supabaseClient.auth.getSession();
-  console.log('getSession:', data, error); // TODO: remove once auth is confirmed working
+  const { data } = await supabaseClient.auth.getSession();
+  // Set directly from this response too (not just the listener above) so
+  // currentUser is guaranteed to be populated before bootApp() -> initApp()
+  // makes its first cloud call, regardless of which of the two fires first.
+  currentUser = data?.session?.user ?? null;
   if (data && data.session) bootApp();
   else showAuthScreen();
 }
