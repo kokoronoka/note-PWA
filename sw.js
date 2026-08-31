@@ -1,4 +1,4 @@
-const CACHE = 'inkpad-v2';
+const CACHE = 'welovenote-v1';
 const ASSETS = [
   '/note-PWA/',
   '/note-PWA/index.html',

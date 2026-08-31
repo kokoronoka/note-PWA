@@ -1,7 +1,7 @@
 {
-  "name": "Inkpad",
-  "short_name": "Inkpad",
-  "description": "Write or draw your notes — stylus or keyboard",
+  "name": "Welovenote",
+  "short_name": "Welovenote",
+  "description": "Welovenote — write or draw your notes",
   "start_url": "/note-PWA/",
   "scope": "/note-PWA/",
   "display": "standalone",

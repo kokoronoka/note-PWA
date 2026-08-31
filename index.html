@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="theme-color" content="#1A1A1A" />
-  <meta name="description" content="Inkpad — write or draw your notes" />
+  <meta name="description" content="Welovenote — write or draw your notes" />
   <link rel="manifest" href="manifest.json" />
   <link rel="apple-touch-icon" href="icons/icon-192.png" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
@@ -20,7 +20,7 @@
   <script src="supabase.js"></script>
   <!-- Cloud note sync (Phase 2) — fetch/upsert/delete against the notes table -->
   <script src="db.js"></script>
-  <title>Inkpad</title>
+  <title>Welovenote</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -829,7 +829,7 @@
 <!-- Auth screen: shown by default, hidden once a session is confirmed -->
 <div class="auth-screen" id="authScreen">
   <div class="auth-card">
-    <div class="logo">Ink<span>pad</span></div>
+    <div class="logo">Welove<span>note</span></div>
     <p class="auth-subtitle">Sign in to your notes</p>
     <input class="auth-input" id="authEmail" type="email" placeholder="Email" autocomplete="email" />
     <input class="auth-input" id="authPassword" type="password" placeholder="Password" autocomplete="current-password" />
@@ -872,7 +872,7 @@
   <!-- Sidebar -->
   <aside class="sidebar" id="sidebar">
     <div class="sidebar-header">
-      <div class="logo">Ink<span>pad</span></div>
+      <div class="logo">Welove<span>note</span></div>
       <button class="btn-new" id="btnNew">+ New</button>
     </div>
     <div class="search-wrap">
@@ -902,7 +902,7 @@
           <line x1="3" y1="18" x2="21" y2="18"/>
         </svg>
       </button>
-      <span style="font-size:15px;font-weight:600">Inkpad</span>
+      <span style="font-size:15px;font-weight:600">Welovenote</span>
     </div>
 
     <!-- Toolbar (hidden when no note) -->

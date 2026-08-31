@@ -1,4 +1,4 @@
--- Inkpad cloud sync (Phase 2) — run manually in Supabase Dashboard → SQL Editor.
+-- Welovenote cloud sync (Phase 2) — run manually in Supabase Dashboard → SQL Editor.
 -- This file is a reference only; nothing in the app executes it automatically.
 
 create table notes (
@@ -24,7 +24,7 @@ on notes for all
 using (auth.uid() = user_id)
 with check (auth.uid() = user_id);
 
--- Inkpad realtime sync (Phase 3)
+-- Welovenote realtime sync (Phase 3)
 -- Enable realtime for notes table:
 -- Go to: Supabase Dashboard → Database → Replication
 -- Find the notes table and toggle ON "Insert", "Update", "Delete"
