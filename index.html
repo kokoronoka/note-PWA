@@ -149,6 +149,49 @@
     .auth-btn:disabled { opacity: 0.6; cursor: not-allowed; }
     .auth-btn:disabled:hover { border-color: var(--border); color: inherit; opacity: 0.6; }
 
+    .auth-divider {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin: 16px 0;
+      color: var(--text-muted);
+      font-size: 12px;
+    }
+    .auth-divider::before,
+    .auth-divider::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: var(--border);
+    }
+
+    .btn-google {
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      padding: 11px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-family: var(--font-ui);
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+      min-height: 44px;
+    }
+    .btn-google:hover {
+      border-color: #4285F4;
+      background: var(--surface);
+    }
+    .btn-google:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+
     .auth-error {
       color: var(--danger);
       font-size: 12px;
@@ -344,15 +387,22 @@
     .note-item:hover .note-item-delete { opacity: 1; }
     .note-item-delete:hover { color: var(--danger); }
 
+    /* Two rows: [dot + email + sign out] on top, note count below — a
+       single row risks overflow in the ~260px sidebar once a full email
+       address is in the mix alongside everything else. */
     .sidebar-footer {
       padding: 12px;
       border-top: 1px solid var(--border);
       font-size: 11px;
       color: var(--text-muted);
       display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .sidebar-footer-row {
+      display: flex;
       align-items: center;
-      justify-content: space-between;
-      gap: 8px;
+      gap: 6px;
     }
 
     .btn-signout {
@@ -362,19 +412,30 @@
       font-family: var(--font-ui);
       font-size: 11px;
       cursor: pointer;
-      padding: 6px 8px;
-      border-radius: 6px;
-      transition: color 0.15s, background 0.15s;
+      padding: 4px 0;
+      text-decoration: underline;
+      transition: color 0.15s;
+      flex-shrink: 0;
     }
-    .btn-signout:hover { color: var(--danger); background: var(--surface2); }
+    .btn-signout:hover { color: var(--danger); }
 
-    .sync-status { display: flex; align-items: center; }
+    .user-email {
+      flex: 1;
+      min-width: 0; /* required for text-overflow:ellipsis to work inside a flex row */
+      font-size: 11px;
+      color: var(--text-muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 140px;
+      display: block;
+    }
+
     #syncDot {
       width: 7px;
       height: 7px;
       border-radius: 50%;
       display: inline-block;
-      margin-right: 6px;
       background: var(--text-muted); /* default: grey = connecting */
       transition: background 0.3s;
       flex-shrink: 0;
@@ -778,6 +839,26 @@
       <button class="auth-btn auth-btn-primary" id="btnSignIn">Sign in</button>
       <button class="auth-btn auth-btn-secondary" id="btnSignUp">Sign up</button>
     </div>
+
+    <!-- Divider -->
+    <div class="auth-divider">
+      <span>or</span>
+    </div>
+
+    <!-- Google button -->
+    <button id="btnGoogleSignIn" class="btn-google">
+      <svg viewBox="0 0 24 24" width="18" height="18">
+        <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26
+          1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+        <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23
+          1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+        <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43
+          8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+        <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09
+          14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+      </svg>
+      Continue with Google
+    </button>
   </div>
 </div>
 
@@ -799,11 +880,12 @@
     </div>
     <div class="notes-list" id="notesList"></div>
     <div class="sidebar-footer">
-      <span class="sync-status">
+      <div class="sidebar-footer-row">
         <span id="syncDot" title="Sync status"></span>
-        <span id="noteCount">0 notes</span>
-      </span>
-      <button class="btn-signout" id="btnSignOut" title="Sign out">Sign out</button>
+        <span id="userEmail" class="user-email"></span>
+        <button class="btn-signout" id="btnSignOut" title="Sign out">Sign out</button>
+      </div>
+      <span id="noteCount">0 notes</span>
     </div>
   </aside>
 
@@ -2136,6 +2218,12 @@ function hideAuthScreen() {
 // (e.g. a duplicate event) just re-shows the app without re-fetching.
 async function bootApp() {
   hideAuthScreen();
+  if (currentUser) {
+    // Google users carry their display name in user_metadata; email/password
+    // users just have .email — email wins when both happen to be present.
+    document.getElementById('userEmail').textContent =
+      currentUser.email || currentUser.user_metadata?.full_name || 'Signed in';
+  }
   if (!appInitialized) {
     appInitialized = true;
     await initApp();
@@ -2223,6 +2311,30 @@ document.getElementById('authPassword').addEventListener('keydown', e => {
   if (e.key === 'Enter') handleSignIn();
 });
 
+const btnGoogleSignIn = document.getElementById('btnGoogleSignIn');
+const googleBtnOriginalHTML = btnGoogleSignIn.innerHTML; // restored if the redirect never happens (error)
+btnGoogleSignIn.addEventListener('click', async () => {
+  setAuthError('');
+  setAuthMessage('');
+  btnGoogleSignIn.disabled = true;
+  btnGoogleSignIn.textContent = 'Redirecting…';
+
+  const { error } = await supabaseClient.auth.signInWithOAuth({
+    provider: 'google',
+    // Dynamic, never hardcoded — works on GitHub Pages (with its /reponame/
+    // subpath) and local dev alike, since it's derived from the page itself.
+    options: { redirectTo: window.location.origin + window.location.pathname }
+  });
+
+  if (error) {
+    setAuthError('Google sign-in failed: ' + error.message);
+    btnGoogleSignIn.disabled = false;
+    btnGoogleSignIn.innerHTML = googleBtnOriginalHTML;
+  }
+  // On success the browser navigates away to Google and back — the existing
+  // onAuthStateChange listener (SIGNED_IN) picks up from there via bootApp()
+});
+
 document.getElementById('btnSignOut').addEventListener('click', async () => {
   if (realtimeChannel) {
     supabaseClient.removeChannel(realtimeChannel);
@@ -2245,6 +2357,7 @@ supabaseClient.auth.onAuthStateChange((event, session) => {
       realtimeChannel = null;
     }
     document.getElementById('syncDot').className = '';
+    document.getElementById('userEmail').textContent = '';
     localStorage.removeItem('inkpad_notes');
     notes = [];
     activeId = null;
