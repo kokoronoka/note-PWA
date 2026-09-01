@@ -58,13 +58,23 @@ async function upsertNoteToCloud(note) {
   }
 }
 
+// Returns true once the row is actually gone from Supabase, false otherwise
+// (including a thrown network error) — callers use this to decide whether
+// the delete needs to be queued and retried later (see addToPendingDeletes).
 async function deleteNoteFromCloud(noteId) {
-  if (!currentUser) return; // not logged in — nothing to delete server-side
-  const { error } = await supabaseClient
-    .from('notes')
-    .delete()
-    .eq('id', noteId);
-  if (error) console.error('Delete failed:', error);
+  if (!currentUser) return true; // not logged in — nothing to delete server-side, trust local
+  try {
+    const { error } = await supabaseClient
+      .from('notes')
+      .delete()
+      .eq('id', noteId)
+      .eq('user_id', currentUser.id); // extra safety: never delete a row this user doesn't own
+    if (error) { console.error('Delete failed:', error); return false; }
+    return true;
+  } catch (err) {
+    console.error('Delete failed:', err);
+    return false;
+  }
 }
 
 function mapCloudNoteToLocal(cloudNote) {
@@ -111,13 +121,21 @@ async function upsertFolderToCloud(folder) {
   if (error) console.error('Folder upsert failed:', error);
 }
 
+// Same true/false contract as deleteNoteFromCloud above
 async function deleteFolderFromCloud(folderId) {
-  if (!currentUser) return;
-  const { error } = await supabaseClient
-    .from('folders')
-    .delete()
-    .eq('id', folderId);
-  if (error) console.error('Folder delete failed:', error);
+  if (!currentUser) return true;
+  try {
+    const { error } = await supabaseClient
+      .from('folders')
+      .delete()
+      .eq('id', folderId)
+      .eq('user_id', currentUser.id);
+    if (error) { console.error('Folder delete failed:', error); return false; }
+    return true;
+  } catch (err) {
+    console.error('Folder delete failed:', err);
+    return false;
+  }
 }
 
 function mapCloudFolder(f) {
@@ -127,4 +145,47 @@ function mapCloudFolder(f) {
     created: new Date(f.created_at).getTime(),
     updated: new Date(f.updated_at).getTime()
   };
+}
+
+// ── Pending deletes queue ──
+// A delete that fails to reach Supabase (offline, transient error) must not
+// be silently forgotten — the row is still gone locally, but still exists in
+// the cloud, so the very next fetch (initApp/syncNow) would resurrect it as
+// a "ghost". Queuing it here means initApp()/syncNow() can filter ghosts out
+// of whatever the cloud returns, and flushPendingDeletes() gets another shot
+// at the actual delete on every subsequent sync until it succeeds.
+const PENDING_DELETES_KEY = 'welovenote_pending_deletes';
+
+function getPendingDeletes() {
+  return JSON.parse(localStorage.getItem(PENDING_DELETES_KEY) || '[]');
+}
+
+function addToPendingDeletes(type, id) {
+  const pending = getPendingDeletes();
+  if (!pending.find(p => p.id === id)) {
+    pending.push({ type, id, timestamp: Date.now() });
+    localStorage.setItem(PENDING_DELETES_KEY, JSON.stringify(pending));
+  }
+}
+
+function removePendingDelete(id) {
+  const updated = getPendingDeletes().filter(p => p.id !== id);
+  localStorage.setItem(PENDING_DELETES_KEY, JSON.stringify(updated));
+}
+
+async function flushPendingDeletes() {
+  if (!currentUser) return;
+  const pending = getPendingDeletes();
+  if (pending.length === 0) return;
+
+  console.log(`Flushing ${pending.length} pending delete(s)`);
+  for (const item of pending) {
+    const success = item.type === 'note'
+      ? await deleteNoteFromCloud(item.id)
+      : await deleteFolderFromCloud(item.id);
+    if (success) {
+      removePendingDelete(item.id);
+      console.log(`Flushed pending delete: ${item.type} ${item.id}`);
+    }
+  }
 }

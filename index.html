@@ -1416,6 +1416,11 @@ async function initApp() {
   initCanvasSize();
   showLoadingState('Loading your notes…');
 
+  // Retry any deletes that didn't confirm last time BEFORE fetching — a
+  // pending delete still sitting in Supabase would otherwise come back in
+  // the fetches below and get treated as a legitimate note/folder again.
+  await flushPendingDeletes();
+
   // Folders load first — notes carry a folderId that only makes sense once
   // the folders array they point into already exists, so filtering/counts
   // are correct the moment renderFolders()/renderList() first run below.
@@ -1424,7 +1429,8 @@ async function initApp() {
     // null = fetch failed/offline → fall back to the local cache below.
     // [] is a real result (this user just has no folders yet) and must win
     // over whatever's cached locally, same as the notes fetch below.
-    folders = cloudFolders.map(mapCloudFolder);
+    const pendingFolderIds = getPendingDeletes().filter(p => p.type === 'folder').map(p => p.id);
+    folders = cloudFolders.map(mapCloudFolder).filter(f => !pendingFolderIds.includes(f.id));
     saveFoldersLocal();
   } else {
     folders = JSON.parse(localStorage.getItem('welovenote_folders') || '[]');
@@ -1432,7 +1438,10 @@ async function initApp() {
 
   const cloudNotes = await fetchNotesFromCloud();
   if (cloudNotes !== null) {
-    notes = cloudNotes.map(mapCloudNoteToLocal);
+    // Same ghost-filter as above: a delete that's still queued (flush just
+    // above may have failed again) must not be resurrected by this fetch.
+    const pendingNoteIds = getPendingDeletes().filter(p => p.type === 'note').map(p => p.id);
+    notes = cloudNotes.map(mapCloudNoteToLocal).filter(n => !pendingNoteIds.includes(n.id));
     saveNotes();
   } else {
     notes = JSON.parse(localStorage.getItem('inkpad_notes') || '[]');
@@ -1473,15 +1482,21 @@ async function syncNow() {
   setSaveStatus('syncing…');
 
   try {
+    // Retry any deletes still queued from a previous failed attempt before
+    // fetching, same reasoning as initApp()
+    await flushPendingDeletes();
+
     const cloudFolders = await fetchFoldersFromCloud();
     if (cloudFolders !== null) {
-      folders = cloudFolders.map(mapCloudFolder);
+      const pendingFolderIds = getPendingDeletes().filter(p => p.type === 'folder').map(p => p.id);
+      folders = cloudFolders.map(mapCloudFolder).filter(f => !pendingFolderIds.includes(f.id));
       saveFoldersLocal();
     }
 
     const cloudNotes = await fetchNotesFromCloud();
     if (cloudNotes !== null) {
-      notes = cloudNotes.map(mapCloudNoteToLocal);
+      const pendingNoteIds = getPendingDeletes().filter(p => p.type === 'note').map(p => p.id);
+      notes = cloudNotes.map(mapCloudNoteToLocal).filter(n => !pendingNoteIds.includes(n.id));
       saveNotes();
     }
 
@@ -1752,10 +1767,12 @@ function createNote() {
   setTimeout(() => document.getElementById('noteTitleInput').focus(), 50);
 }
 
-function deleteNote(id) {
+async function deleteNote(id) {
+  // Optimistic: local state and UI update immediately, before the cloud
+  // delete even starts — the user should never wait on a network round trip
+  // just to see a note disappear from the list.
   notes = notes.filter(n => n.id !== id);
   saveNotes();
-  deleteNoteFromCloud(id).catch(err => console.error('Cloud delete failed:', err));
   if (activeId === id) {
     activeId = null;
     if (notes.length > 0) selectNote(notes[0].id);
@@ -1763,6 +1780,15 @@ function deleteNote(id) {
   }
   renderFolders(); // the deleted note's folder-count badge just shrank by one
   renderList();
+
+  // If the cloud delete doesn't confirm, queue it — otherwise the next
+  // fetch would resurrect this note as a ghost (see flushPendingDeletes)
+  const success = await deleteNoteFromCloud(id);
+  if (!success) {
+    addToPendingDeletes('note', id);
+    setSaveStatus('⚠ delete queued');
+    setTimeout(() => setSaveStatus('saved'), 3000);
+  }
 }
 
 function saveNotes() {
@@ -2603,7 +2629,7 @@ function startRenameFolder(id) {
   });
 }
 
-function deleteFolder(id, e) {
+async function deleteFolder(id, e) {
   e.stopPropagation();
   const folder = folders.find(f => f.id === id);
   if (!folder) return;
@@ -2623,10 +2649,14 @@ function deleteFolder(id, e) {
 
   folders = folders.filter(f => f.id !== id);
   saveFoldersLocal();
-  deleteFolderFromCloud(id).catch(err => console.error('Folder delete failed:', err));
 
   if (activeFolderId === id) selectFolder(null); // also re-renders folders + list
   else renderFolders();
+
+  // Same optimistic-then-confirm pattern as deleteNote — queue it if the
+  // cloud delete doesn't confirm, so it doesn't come back as a ghost folder
+  const success = await deleteFolderFromCloud(id);
+  if (!success) addToPendingDeletes('folder', id);
 }
 
 function selectFolder(folderId) {
