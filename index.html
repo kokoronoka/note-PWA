@@ -1350,6 +1350,35 @@
 </div>
 
 <script>
+// ── Safe localStorage helper — must be defined first ──
+// Guards every localStorage read this app makes against corrupted JSON (a
+// previous write got cut off, or the value was hand-edited/tampered with)
+// and values of the wrong shape (an old format from before some feature
+// existed). Either one previously threw before initApp() ever reached
+// hideLoadingState(), which is what produced the infinite-loading-screen
+// bug. Never touches unrelated keys — notably Supabase's own 'sb-*' auth
+// session keys are never read through this. Declared with `function`, not
+// an arrow/const, so it's hoisted to the top of this script block and safe
+// to call from the state initializers immediately below, before this line
+// is even reached during a normal top-to-bottom read of the file.
+function safeGetLocal(key, fallback = []) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(fallback) && !Array.isArray(parsed)) {
+      console.warn(`localStorage key "${key}" had wrong type, clearing it`);
+      localStorage.removeItem(key);
+      return fallback;
+    }
+    return parsed;
+  } catch (err) {
+    console.warn(`localStorage key "${key}" was corrupted, clearing it:`, err);
+    localStorage.removeItem(key);
+    return fallback;
+  }
+}
+
 // ── Storage version migration ──
 // Bump STORAGE_VERSION whenever a future change makes an old cached
 // note/folder/pending-delete shape actively wrong (not just tolerated by

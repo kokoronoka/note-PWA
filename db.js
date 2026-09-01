@@ -13,32 +13,10 @@
 // time any of these functions can be called, it's already set.
 let currentUser = null;
 
-// Guards every localStorage read this app makes against two failure modes
-// seen in the wild: corrupted JSON (a previous write got cut off, or the
-// value was hand-edited/tampered with) and a value of the wrong shape (an
-// old format from before some feature existed). Either one previously threw
-// out of initApp() before it ever reached hideLoadingState(), which is what
-// produced the infinite-loading-screen bug. Never touches unrelated keys —
-// notably Supabase's own 'sb-*' auth session keys are never read through
-// this, so a corrupted note/folder cache can't affect login state.
-function safeGetLocal(key, fallback = []) {
-  try {
-    const raw = localStorage.getItem(key);
-    if (!raw) return fallback;
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(fallback) && !Array.isArray(parsed)) {
-      console.warn(`localStorage key "${key}" had wrong type, clearing it`);
-      localStorage.removeItem(key);
-      return fallback;
-    }
-    return parsed;
-  } catch (err) {
-    console.warn(`localStorage key "${key}" was corrupted, clearing it:`, err);
-    localStorage.removeItem(key);
-    return fallback;
-  }
-}
-
+// safeGetLocal() is defined in index.html's inline <script> (loaded after
+// this file), not here — getPendingDeletes() below calls it, which works
+// because that call only ever happens well after the whole page has loaded
+// and safeGetLocal is a global by then, not at this file's own load time.
 async function fetchNotesFromCloud() {
   if (!currentUser) return null; // not logged in — caller falls back to localStorage
   const { data, error } = await supabaseClient

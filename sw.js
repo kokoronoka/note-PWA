@@ -1,4 +1,4 @@
-const CACHE = 'welovenote-v2';
+const CACHE = 'welovenote-v3';
 const ASSETS = [
   '/note-PWA/',
   '/note-PWA/index.html',
