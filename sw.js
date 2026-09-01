@@ -1,4 +1,4 @@
-const CACHE = 'welovenote-v1';
+const CACHE = 'welovenote-v2';
 const ASSETS = [
   '/note-PWA/',
   '/note-PWA/index.html',
@@ -31,6 +31,11 @@ self.addEventListener('activate', e => {
 });
 
 self.addEventListener('fetch', e => {
+  // Cache API only supports GET — Supabase's POST/PATCH calls (and any
+  // other non-GET request) must go straight to the network, uncached, or
+  // cache.put() below throws ("Request method 'POST' is unsupported")
+  if (e.request.method !== 'GET') return;
+
   // Network-first for navigation; cache-first for static assets
   if (e.request.mode === 'navigate') {
     e.respondWith(

@@ -7,6 +7,7 @@
   <meta name="description" content="Welovenote — write or draw your notes" />
   <link rel="manifest" href="manifest.json" />
   <link rel="apple-touch-icon" href="icons/icon-192.png" />
+  <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-touch-fullscreen" content="yes" />
@@ -1336,7 +1337,6 @@ function subscribeToRealtime() {
 
 function handleRealtimeChange(payload) {
   const { eventType, new: newRecord, old: oldRecord } = payload;
-  console.log('[realtime] note event', eventType, newRecord?.id, 'folder:', newRecord?.folder_id); // TODO: remove once cross-device sync is confirmed
 
   if (eventType === 'INSERT') {
     // Another device created a note — only add if we don't already have it
@@ -1393,7 +1393,12 @@ function handleRealtimeChange(payload) {
   }
 
   if (eventType === 'DELETE') {
-    const deletedId = oldRecord.id;
+    // old carries the deleted row; new is always empty on a DELETE event
+    const deletedId = oldRecord?.id;
+    if (!deletedId) {
+      console.warn('[realtime] note DELETE missing old record — check replica identity full is set on notes table');
+      return;
+    }
     notes = notes.filter(n => n.id !== deletedId);
     saveNotesLocal();
     renderFolders(); // the deleted note's folder (if any) just lost a member
@@ -1411,7 +1416,6 @@ function handleRealtimeChange(payload) {
 // every event just re-syncs local state and re-renders.
 function handleFolderRealtimeChange(payload) {
   const { eventType, new: newRecord, old: oldRecord } = payload;
-  console.log('[realtime] folder event', eventType, newRecord?.id, newRecord?.name); // TODO: remove once cross-device sync is confirmed
 
   if (eventType === 'INSERT') {
     if (!folders.find(f => f.id === newRecord.id)) {
@@ -1425,7 +1429,12 @@ function handleFolderRealtimeChange(payload) {
   }
 
   if (eventType === 'DELETE') {
-    const deletedId = oldRecord.id;
+    // old carries the deleted row; new is always empty on a DELETE event
+    const deletedId = oldRecord?.id;
+    if (!deletedId) {
+      console.warn('[realtime] DELETE missing old record — check replica identity full is set on folders table');
+      return;
+    }
     folders = folders.filter(f => f.id !== deletedId);
     if (activeFolderId === deletedId) activeFolderId = null;
     notes.forEach(n => { if (n.folderId === deletedId) n.folderId = null; });
