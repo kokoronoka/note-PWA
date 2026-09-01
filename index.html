@@ -636,6 +636,7 @@
       transform: translateZ(0);
     }
     .note-canvas.eraser-mode { cursor: cell; }
+    .note-canvas.hand-mode { cursor: grab; }
 
     /* Active-stroke scratch canvas (see startDraw/draw/endDraw): overlays
        #noteCanvas exactly, but never receives input itself — mainCanvas
@@ -926,12 +927,20 @@
 
       <!-- Ink tools (shown in ink mode) -->
       <div class="ink-tools" id="inkTools">
-        <button class="tool-btn active" id="toolPen" title="Pen">
+        <button class="tool-btn active" id="toolHand" title="Hand (drag) — H">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="16" height="16">
+            <path d="M18 11V8a2 2 0 0 0-4 0v3"/>
+            <path d="M14 10V6a2 2 0 0 0-4 0v4"/>
+            <path d="M10 9.5V4a2 2 0 0 0-4 0v8"/>
+            <path d="M6 12v2a6 6 0 0 0 6 6h2a6 6 0 0 0 6-6v-2a2 2 0 0 0-2-2H8a2 2 0 0 0-2 2z"/>
+          </svg>
+        </button>
+        <button class="tool-btn" id="toolPen" title="Pen — P">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
             <path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/>
           </svg>
         </button>
-        <button class="tool-btn" id="toolEraser" title="Eraser">
+        <button class="tool-btn" id="toolEraser" title="Eraser — E">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
             <path d="M20 20H7L3 16l11-11 7 7-1 8z"/>
             <path d="M6.5 17.5l4-4"/>
@@ -1059,7 +1068,7 @@ let drawing = false;
 let lastX = 0, lastY = 0;
 let currentColor = '#1A1A1A';
 let strokeWidth = 3;
-let isEraser = false;
+let activeTool = 'hand'; // 'hand' | 'pen' | 'eraser'
 let undoStack = [];
 let saveTimer = null;
 let searchQuery = '';
@@ -1085,6 +1094,7 @@ let zoom = 1, panX = 0, panY = 0;
 const activeTouches = new Map(); // pointerId -> {x, y} in canvasWrap-local space
 let pinch = null;                // { startDist, anchorCanvasPt } while a 2-finger gesture is active
 let middleDrag = null;           // { startX, startY, startPanX, startPanY } while middle-mouse-dragging
+let handPan = null;              // { startX, startY, startPanX, startPanY } while hand-tool single-pointer panning
 
 const canvas = document.getElementById('noteCanvas');
 const ctx = canvas.getContext('2d');
@@ -1427,6 +1437,10 @@ function selectNote(id) {
   setSaveStatus('saved');
   renderList();
 
+  // Every newly opened/created note starts in hand (pan) mode — drawing is
+  // an explicit choice, never the default a user lands in.
+  setActiveTool('hand');
+
   // Held a little past the synchronous work above since the ink image load
   // (if any) finishes asynchronously — give it room to land before realtime
   // updates for this note are allowed through again.
@@ -1645,10 +1659,11 @@ function draw(e) {
   if (!drawing) return;
   const pos = getPos(e);
   const pressure = pos.pressure > 0 ? pos.pressure : 0.5;
-  const dynamicWidth = isEraser ? 20 : strokeWidth * (0.5 + pressure * 1.2);
+  const erasing = activeTool === 'eraser';
+  const dynamicWidth = erasing ? 20 : strokeWidth * (0.5 + pressure * 1.2);
 
-  bufferCtx.globalCompositeOperation = isEraser ? 'destination-out' : 'source-over';
-  bufferCtx.strokeStyle = isEraser ? 'rgba(0,0,0,1)' : currentColor;
+  bufferCtx.globalCompositeOperation = erasing ? 'destination-out' : 'source-over';
+  bufferCtx.strokeStyle = erasing ? 'rgba(0,0,0,1)' : currentColor;
   bufferCtx.lineWidth = dynamicWidth;
 
   bufferCtx.lineTo(pos.x, pos.y);
@@ -1678,6 +1693,36 @@ function endDraw(e) {
   bufferCanvas.style.display = 'none';
 }
 
+// Hand-tool single-pointer pan (one finger, or mouse-drag while hand tool is
+// active). Mirrors middleDrag below, kept separate so a 2nd touch or a
+// stylus can cancel/ignore it without touching middleDrag's own state.
+function startPan(e) {
+  handPan = { startX: e.clientX, startY: e.clientY, startPanX: panX, startPanY: panY };
+  canvas.style.cursor = 'grabbing';
+}
+
+function updatePan(e) {
+  if (!handPan) return;
+  panX = handPan.startPanX + (e.clientX - handPan.startX);
+  panY = handPan.startPanY + (e.clientY - handPan.startY);
+  applyTransform(); // clamps panX/panY internally (see clampPan)
+}
+
+function endPan() {
+  handPan = null;
+  applyToolCursor();
+}
+
+// Restores the cursor for whichever tool is currently active — used after
+// any transient cursor override (middle-drag pan, space-drag pan, hand pan)
+// ends, instead of blindly clearing to '' which would wipe out the eraser's
+// custom cursor image set by updateEraserCursor().
+function applyToolCursor() {
+  if (activeTool === 'eraser') updateEraserCursor();
+  else if (activeTool === 'hand') canvas.style.cursor = 'grab';
+  else canvas.style.cursor = '';
+}
+
 // Pointer events handle all three input kinds. Touch is tracked separately
 // (activeTouches) so a 2nd finger starts a pinch/pan instead of a 2nd stroke;
 // mouse/pen always draw, except a middle-mouse-button drag, which pans.
@@ -1687,9 +1732,11 @@ canvas.addEventListener('pointerdown', e => {
     activeTouches.set(e.pointerId, wrapPoint(e));
     if (activeTouches.size === 1) {
       e.preventDefault();
-      startDraw(e);
+      if (activeTool === 'hand') startPan(e);
+      else startDraw(e);
     } else if (activeTouches.size === 2) {
       endDraw(e); // a 2nd finger cancels any in-progress single-finger stroke
+      endPan();   // ...or an in-progress single-finger hand-tool pan
       const [p1, p2] = [...activeTouches.values()];
       pinch = { prevDist: pinchDistance(p1, p2), prevMid: pinchMidpoint(p1, p2) };
     }
@@ -1697,6 +1744,7 @@ canvas.addEventListener('pointerdown', e => {
   }
 
   // Middle-mouse-button drag, or Space held + left-click drag, both pan
+  // regardless of the active tool
   if (e.pointerType === 'mouse' && (e.button === 1 || (e.button === 0 && spaceHeld))) {
     e.preventDefault();
     try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
@@ -1705,8 +1753,16 @@ canvas.addEventListener('pointerdown', e => {
     return;
   }
 
-  // Left-click mouse or pen: draw
-  startDraw(e);
+  // Stylus always draws/erases, regardless of the active tool — a finger
+  // navigates, a stylus writes, matching every professional note app
+  if (e.pointerType === 'pen') {
+    startDraw(e);
+    return;
+  }
+
+  // Mouse (left-click): behaviour follows the active tool
+  if (activeTool === 'hand') startPan(e);
+  else startDraw(e);
 }, { passive: false });
 
 // Batches fast-firing pointermove events into at most one canvas/transform
@@ -1724,6 +1780,9 @@ function processPointerMove() {
     if (activeTouches.size >= 2 && pinch) {
       updatePinch();
       debounceSave();
+    } else if (activeTouches.size === 1 && handPan) {
+      updatePan(e);
+      debounceSave();
     } else if (activeTouches.size === 1 && drawing) {
       // Replay every point sampled since the last frame (if the browser
       // coalesced several into this one event) for a fully-sampled line,
@@ -1738,6 +1797,12 @@ function processPointerMove() {
     panX = middleDrag.startPanX + (e.clientX - middleDrag.startX);
     panY = middleDrag.startPanY + (e.clientY - middleDrag.startY);
     applyTransform();
+    debounceSave();
+    return;
+  }
+
+  if (handPan) {
+    updatePan(e);
     debounceSave();
     return;
   }
@@ -1766,14 +1831,14 @@ function flushPendingMove() {
 canvas.addEventListener('pointermove', e => {
   if (e.pointerType === 'touch' && activeTouches.has(e.pointerId)) {
     activeTouches.set(e.pointerId, wrapPoint(e));
-    if ((activeTouches.size >= 2 && pinch) || (activeTouches.size === 1 && drawing)) {
+    if ((activeTouches.size >= 2 && pinch) || (activeTouches.size === 1 && (drawing || handPan))) {
       e.preventDefault();
     }
     scheduleMove(e);
     return;
   }
 
-  if (middleDrag || drawing) e.preventDefault();
+  if (middleDrag || handPan || drawing) e.preventDefault();
   scheduleMove(e);
 }, { passive: false });
 
@@ -1782,14 +1847,19 @@ function releasePointer(e) {
   if (e.pointerType === 'touch') {
     activeTouches.delete(e.pointerId);
     if (activeTouches.size < 2) pinch = null;
-    if (activeTouches.size === 0) endDraw(e);
+    if (activeTouches.size === 0) { endDraw(e); endPan(); }
     return;
   }
   // Checked by state, not button number, so a Space+left-click pan (button
   // 0) still ends correctly here, not just an actual middle-click (button 1)
   if (middleDrag) {
     middleDrag = null;
-    canvas.style.cursor = spaceHeld ? 'grab' : '';
+    if (spaceHeld) canvas.style.cursor = 'grab';
+    else applyToolCursor();
+    return;
+  }
+  if (handPan) {
+    endPan();
     return;
   }
   endDraw(e);
@@ -1828,12 +1898,12 @@ document.addEventListener('keydown', e => {
 document.addEventListener('keyup', e => {
   if (e.code === 'Space') {
     spaceHeld = false;
-    if (!middleDrag) canvas.style.cursor = '';
+    if (!middleDrag) applyToolCursor();
   }
 });
 window.addEventListener('blur', () => {
   spaceHeld = false;
-  if (!middleDrag) canvas.style.cursor = '';
+  if (!middleDrag) applyToolCursor();
 });
 
 // ── Toolbar buttons ──
@@ -1860,7 +1930,7 @@ document.getElementById('noteTextarea').addEventListener('input', () => {
 // stroke-size slider only ever affects the pen, not the eraser, so this
 // deliberately does not track it.
 function updateEraserCursor() {
-  if (!isEraser) {
+  if (activeTool !== 'eraser') {
     canvas.style.cursor = '';
     return;
   }
@@ -1879,21 +1949,22 @@ function updateEraserCursor() {
   canvas.style.cursor = `url(${url}) ${size / 2 + 2} ${size / 2 + 2}, cell`;
 }
 
-document.getElementById('toolPen').addEventListener('click', () => {
-  isEraser = false;
-  canvas.classList.remove('eraser-mode');
-  updateEraserCursor();
-  document.getElementById('toolPen').classList.add('active');
-  document.getElementById('toolEraser').classList.remove('active');
-});
+// Only one of hand/pen/eraser is ever active at a time — this is the single
+// place that switches between them, keeping the activeTool var, the toolbar
+// button states, and the canvas cursor/class all in sync.
+function setActiveTool(tool) {
+  activeTool = tool;
+  document.getElementById('toolHand').classList.toggle('active', tool === 'hand');
+  document.getElementById('toolPen').classList.toggle('active', tool === 'pen');
+  document.getElementById('toolEraser').classList.toggle('active', tool === 'eraser');
+  canvas.classList.toggle('eraser-mode', tool === 'eraser');
+  canvas.classList.toggle('hand-mode', tool === 'hand');
+  applyToolCursor();
+}
 
-document.getElementById('toolEraser').addEventListener('click', () => {
-  isEraser = true;
-  canvas.classList.add('eraser-mode');
-  updateEraserCursor();
-  document.getElementById('toolEraser').classList.add('active');
-  document.getElementById('toolPen').classList.remove('active');
-});
+document.getElementById('toolHand').addEventListener('click', () => setActiveTool('hand'));
+document.getElementById('toolPen').addEventListener('click', () => setActiveTool('pen'));
+document.getElementById('toolEraser').addEventListener('click', () => setActiveTool('eraser'));
 
 document.getElementById('strokeSize').addEventListener('input', e => {
   strokeWidth = parseInt(e.target.value);
@@ -1920,11 +1991,7 @@ document.getElementById('toolUndo').addEventListener('click', () => {
 document.querySelectorAll('.color-swatch').forEach(sw => {
   sw.addEventListener('click', () => {
     currentColor = sw.dataset.color;
-    isEraser = false;
-    canvas.classList.remove('eraser-mode');
-    updateEraserCursor();
-    document.getElementById('toolPen').classList.add('active');
-    document.getElementById('toolEraser').classList.remove('active');
+    setActiveTool('pen');
     document.querySelectorAll('.color-swatch').forEach(s => s.classList.remove('active'));
     sw.classList.add('active');
     document.getElementById('colorCustom').value = currentColor;
@@ -1934,11 +2001,7 @@ document.querySelectorAll('.color-swatch').forEach(sw => {
 document.getElementById('colorCustom').addEventListener('input', e => {
   currentColor = e.target.value;
   document.querySelectorAll('.color-swatch').forEach(s => s.classList.remove('active'));
-  isEraser = false;
-  canvas.classList.remove('eraser-mode');
-  updateEraserCursor();
-  document.getElementById('toolPen').classList.add('active');
-  document.getElementById('toolEraser').classList.remove('active');
+  setActiveTool('pen');
 });
 
 // ── Search ──
@@ -2193,6 +2256,13 @@ document.addEventListener('keydown', e => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'z' && mode === 'ink') {
     e.preventDefault();
     document.getElementById('toolUndo').click();
+  }
+  // Single-key tool shortcuts — only outside of text inputs, and only
+  // while a note is open in ink mode
+  if (!isTypingTarget(e.target) && !e.ctrlKey && !e.metaKey && !e.altKey && mode === 'ink' && activeId) {
+    if (e.key === 'h' || e.key === 'H') setActiveTool('hand');
+    else if (e.key === 'p' || e.key === 'P') setActiveTool('pen');
+    else if (e.key === 'e' || e.key === 'E') setActiveTool('eraser');
   }
 });
 
