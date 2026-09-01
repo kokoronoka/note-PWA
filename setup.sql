@@ -67,3 +67,15 @@ alter table notes add column folder_id text references folders(id) on delete set
 
 -- Enable realtime for folders table the same way as notes:
 -- Supabase Dashboard → Database → Replication → folders → Insert/Update/Delete ON
+--
+-- That dashboard toggle IS this SQL — run it directly if you'd rather not
+-- click through the UI. This is the single most likely cause of "folders
+-- don't sync across devices": creating the table does NOT add it to the
+-- realtime publication, that's a separate, manual step.
+--
+-- IMPORTANT: subscribeToRealtime() in index.html puts the notes and folders
+-- listeners on ONE shared channel. If folders isn't in the publication, the
+-- whole channel — including the notes listener — fails to subscribe
+-- (CHANNEL_ERROR), which would also explain new notes silently failing to
+-- sync, not just folders.
+alter publication supabase_realtime add table folders;

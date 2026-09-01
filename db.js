@@ -33,6 +33,8 @@ async function upsertNoteToCloud(note) {
     console.warn('Large ink note, consider reducing canvas size');
   }
 
+  console.log('[sync] upserting note', note.id, 'folder:', note.folderId); // TODO: remove once cross-device sync is confirmed
+
   const { error } = await supabaseClient
     .from('notes')
     .upsert({
@@ -100,6 +102,7 @@ async function upsertFolderToCloud(folder) {
     console.warn('No user session — skipping cloud save');
     return;
   }
+  console.log('[sync] upserting folder', folder.id, folder.name); // TODO: remove once cross-device sync is confirmed
   const { error } = await supabaseClient
     .from('folders')
     .upsert({

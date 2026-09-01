@@ -1254,20 +1254,29 @@ let rafPending = false, rafHandle = null, lastMoveEvent = null;
 async function initApp() {
   initCanvasSize();
   showLoadingState('Loading your notes…');
-  const cloudNotes = await fetchNotesFromCloud();
-  if (cloudNotes && cloudNotes.length > 0) {
-    notes = cloudNotes.map(mapCloudNoteToLocal);
-    localStorage.setItem('inkpad_notes', JSON.stringify(notes));
-  } else {
-    notes = JSON.parse(localStorage.getItem('inkpad_notes') || '[]');
-  }
+
+  // Folders load first — notes carry a folderId that only makes sense once
+  // the folders array they point into already exists, so filtering/counts
+  // are correct the moment renderFolders()/renderList() first run below.
   const cloudFolders = await fetchFoldersFromCloud();
-  if (cloudFolders) {
+  if (cloudFolders !== null) {
+    // null = fetch failed/offline → fall back to the local cache below.
+    // [] is a real result (this user just has no folders yet) and must win
+    // over whatever's cached locally, same as the notes fetch below.
     folders = cloudFolders.map(mapCloudFolder);
     saveFoldersLocal();
   } else {
     folders = JSON.parse(localStorage.getItem('welovenote_folders') || '[]');
   }
+
+  const cloudNotes = await fetchNotesFromCloud();
+  if (cloudNotes !== null) {
+    notes = cloudNotes.map(mapCloudNoteToLocal);
+    saveNotes();
+  } else {
+    notes = JSON.parse(localStorage.getItem('inkpad_notes') || '[]');
+  }
+
   hideLoadingState();
   renderFolders();
   renderList();
@@ -1306,6 +1315,14 @@ function subscribeToRealtime() {
         handleFolderRealtimeChange
       )
       .subscribe(status => {
+        if (status === 'CHANNEL_ERROR') {
+          // Most common cause: one of the two tables above isn't in the
+          // realtime publication yet — Supabase Dashboard → Database →
+          // Publications → supabase_realtime, or the "add table" lines in
+          // setup.sql — which fails the whole channel, both tables included
+          console.error('Realtime subscription failed — check Supabase Dashboard → Database → Publications → ' +
+            'supabase_realtime and confirm both the notes and folders tables are toggled ON');
+        }
         const dot = document.getElementById('syncDot');
         if (!dot) return;
         if (status === 'SUBSCRIBED') dot.className = 'connected';
@@ -1319,6 +1336,7 @@ function subscribeToRealtime() {
 
 function handleRealtimeChange(payload) {
   const { eventType, new: newRecord, old: oldRecord } = payload;
+  console.log('[realtime] note event', eventType, newRecord?.id, 'folder:', newRecord?.folder_id); // TODO: remove once cross-device sync is confirmed
 
   if (eventType === 'INSERT') {
     // Another device created a note — only add if we don't already have it
@@ -1328,6 +1346,7 @@ function handleRealtimeChange(payload) {
       const note = mapCloudNoteToLocal(newRecord);
       notes.unshift(note);
       saveNotesLocal();
+      renderFolders(); // the note's folder (if any) just gained a member — refresh its count badge
       renderList();
       // Do not auto-switch to this note — the user may be busy elsewhere
     }
@@ -1350,6 +1369,7 @@ function handleRealtimeChange(payload) {
       // Not the note currently open — always safe to update quietly
       notes[index] = updatedNote;
       saveNotesLocal();
+      renderFolders(); // folder assignment may have changed — refresh count badges
       renderList();
       return;
     }
@@ -1367,6 +1387,7 @@ function handleRealtimeChange(payload) {
       notes[index] = updatedNote;
       saveNotesLocal();
       reloadActiveNoteContent(updatedNote);
+      renderFolders();
       renderList();
     }
   }
@@ -1375,6 +1396,7 @@ function handleRealtimeChange(payload) {
     const deletedId = oldRecord.id;
     notes = notes.filter(n => n.id !== deletedId);
     saveNotesLocal();
+    renderFolders(); // the deleted note's folder (if any) just lost a member
     renderList();
     if (activeId === deletedId) {
       activeId = null;
@@ -1389,6 +1411,7 @@ function handleRealtimeChange(payload) {
 // every event just re-syncs local state and re-renders.
 function handleFolderRealtimeChange(payload) {
   const { eventType, new: newRecord, old: oldRecord } = payload;
+  console.log('[realtime] folder event', eventType, newRecord?.id, newRecord?.name); // TODO: remove once cross-device sync is confirmed
 
   if (eventType === 'INSERT') {
     if (!folders.find(f => f.id === newRecord.id)) {
