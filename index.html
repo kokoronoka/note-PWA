@@ -387,6 +387,128 @@
     .note-item:hover .note-item-delete { opacity: 1; }
     .note-item-delete:hover { color: var(--danger); }
 
+    /* ── Folders ── */
+    .folders-list {
+      padding: 8px 8px 4px;
+      max-height: 240px;
+      overflow-y: auto;
+      border-bottom: 1px solid var(--border);
+    }
+    .folders-list::-webkit-scrollbar { width: 4px; }
+    .folders-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+    .folder-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 12px;
+      border-radius: var(--radius);
+      cursor: pointer;
+      font-size: 13px;
+      color: var(--text-muted);
+      transition: background 0.12s, color 0.12s;
+      position: relative;
+      min-height: 40px;
+    }
+    .folder-item:hover {
+      background: var(--surface2);
+      color: var(--text);
+    }
+    .folder-item.active {
+      background: var(--accent-soft);
+      color: var(--accent);
+    }
+    .folder-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .folder-name[contenteditable="true"] {
+      outline: 1px solid var(--accent);
+      border-radius: 4px;
+      white-space: normal;
+    }
+    .folder-count {
+      margin-left: auto;
+      font-size: 11px;
+      color: var(--text-muted);
+      background: var(--surface2);
+      padding: 1px 6px;
+      border-radius: 10px;
+      min-width: 20px;
+      text-align: center;
+    }
+    .folder-actions {
+      display: none;
+      gap: 2px;
+      flex-shrink: 0;
+    }
+    .folder-item:hover .folder-actions { display: flex; }
+    .folder-actions button {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      padding: 3px;
+      border-radius: 4px;
+      display: flex;
+      align-items: center;
+      transition: color 0.12s;
+    }
+    .folder-actions button:hover { color: var(--text); }
+    .folder-actions button.folder-delete-btn:hover { color: var(--danger); }
+
+    .btn-new-folder {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      width: 100%;
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      font-family: var(--font-ui);
+      font-size: 12px;
+      cursor: pointer;
+      transition: color 0.12s;
+      margin-top: 4px;
+    }
+    .btn-new-folder:hover { color: var(--accent); }
+
+    /* ── Note move-to-folder context menu ── */
+    .context-menu {
+      position: fixed;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 6px;
+      z-index: 1000;
+      min-width: 180px;
+      max-height: 60vh;
+      overflow-y: auto;
+      box-shadow: 0 8px 30px #00000055;
+      font-size: 13px;
+    }
+    .context-menu-label {
+      color: var(--text-muted);
+      font-size: 11px;
+      padding: 4px 8px 6px;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .context-menu-item {
+      padding: 8px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      color: var(--text);
+      transition: background 0.1s;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .context-menu-item:hover { background: var(--surface2); }
+
     /* Two rows: [dot + email + sign out] on top, note count below — a
        single row risks overflow in the ~260px sidebar once a full email
        address is in the mix alongside everything else. */
@@ -796,6 +918,9 @@
       /* No :hover on touch — keep the delete button visibly tappable instead */
       .note-item-delete { opacity: 0.4; }
       .note-item-delete:active { opacity: 1; }
+      /* Same reasoning for folder rename/delete — no hover to reveal them on touch */
+      .folder-actions { display: flex; opacity: 0.5; }
+      .folder-actions button:active { opacity: 1; }
 
       /* Smaller, less obtrusive zoom controls, tucked closer to the corner */
       .zoom-controls { right: 8px; bottom: 8px; padding: 2px; gap: 1px; }
@@ -879,6 +1004,7 @@
     <div class="search-wrap">
       <input class="search-input" id="searchInput" type="text" placeholder="Search notes…" />
     </div>
+    <div class="folders-list" id="foldersList"></div>
     <div class="notes-list" id="notesList"></div>
     <div class="sidebar-footer">
       <div class="sidebar-footer-row">
@@ -892,6 +1018,9 @@
 
   <!-- Backdrop shown behind the sidebar drawer on mobile/tablet -->
   <div class="sidebar-overlay" id="sidebarOverlay"></div>
+
+  <!-- Right-click / long-press "move to folder" menu — populated by showContextMenu() -->
+  <div class="context-menu" id="contextMenu" style="display:none"></div>
 
   <!-- Main -->
   <div class="main" id="main">
@@ -1063,6 +1192,8 @@
 // ── State ──
 let notes = JSON.parse(localStorage.getItem('inkpad_notes') || '[]');
 let activeId = null;
+let folders = JSON.parse(localStorage.getItem('welovenote_folders') || '[]');
+let activeFolderId = null; // null = "All Notes" view
 let mode = 'ink'; // 'ink' | 'type'
 let drawing = false;
 let lastX = 0, lastY = 0;
@@ -1130,7 +1261,15 @@ async function initApp() {
   } else {
     notes = JSON.parse(localStorage.getItem('inkpad_notes') || '[]');
   }
+  const cloudFolders = await fetchFoldersFromCloud();
+  if (cloudFolders) {
+    folders = cloudFolders.map(mapCloudFolder);
+    saveFoldersLocal();
+  } else {
+    folders = JSON.parse(localStorage.getItem('welovenote_folders') || '[]');
+  }
   hideLoadingState();
+  renderFolders();
   renderList();
   if (notes.length === 0) createNote();
   else selectNote(notes[0].id);
@@ -1160,6 +1299,11 @@ function subscribeToRealtime() {
         'postgres_changes',
         { event: '*', schema: 'public', table: 'notes', filter: `user_id=eq.${currentUser.id}` },
         handleRealtimeChange
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'folders', filter: `user_id=eq.${currentUser.id}` },
+        handleFolderRealtimeChange
       )
       .subscribe(status => {
         const dot = document.getElementById('syncDot');
@@ -1240,6 +1384,36 @@ function handleRealtimeChange(payload) {
   }
 }
 
+// Same idea as handleRealtimeChange, but for the folders table — folders
+// have no "active editing" state to protect (unlike a note mid-stroke), so
+// every event just re-syncs local state and re-renders.
+function handleFolderRealtimeChange(payload) {
+  const { eventType, new: newRecord, old: oldRecord } = payload;
+
+  if (eventType === 'INSERT') {
+    if (!folders.find(f => f.id === newRecord.id)) {
+      folders.push(mapCloudFolder(newRecord));
+    }
+  }
+
+  if (eventType === 'UPDATE') {
+    const index = folders.findIndex(f => f.id === newRecord.id);
+    if (index !== -1) folders[index] = mapCloudFolder(newRecord);
+  }
+
+  if (eventType === 'DELETE') {
+    const deletedId = oldRecord.id;
+    folders = folders.filter(f => f.id !== deletedId);
+    if (activeFolderId === deletedId) activeFolderId = null;
+    notes.forEach(n => { if (n.folderId === deletedId) n.folderId = null; });
+    saveNotesLocal();
+  }
+
+  saveFoldersLocal();
+  renderFolders();
+  renderList();
+}
+
 // Applies a remote update to the currently-open note without disturbing
 // whatever the user is focused on (title/textarea keep their live value if
 // the user is currently in that field).
@@ -1288,12 +1462,14 @@ function createNote() {
     zoom: 1,
     panX: 0,
     panY: 0,
+    folderId: activeFolderId, // lands in whichever folder is currently open
     created: Date.now(),
     updated: Date.now()
   };
   notes.unshift(note);
   saveNotes();
   upsertNoteToCloud(note).catch(err => console.error('Background sync failed:', err));
+  renderFolders(); // folder-count badge for note.folderId just grew by one
   renderList();
   selectNote(note.id); // selectNote() saves the outgoing note, then clears the textarea before loading this one
   // Focus title
@@ -1310,6 +1486,7 @@ function deleteNote(id, e) {
     if (notes.length > 0) selectNote(notes[0].id);
     else showEmpty();
   }
+  renderFolders(); // the deleted note's folder-count badge just shrank by one
   renderList();
 }
 
@@ -1318,6 +1495,10 @@ function saveNotes() {
 }
 // Alias used by the realtime sync code below — same function, not a copy.
 const saveNotesLocal = saveNotes;
+
+function saveFoldersLocal() {
+  localStorage.setItem('welovenote_folders', JSON.stringify(folders));
+}
 
 function getActive() { return notes.find(n => n.id === activeId); }
 
@@ -2010,13 +2191,230 @@ document.getElementById('searchInput').addEventListener('input', e => {
   renderList();
 });
 
+// ── Folders ──
+
+// Escapes user-entered text (folder names are freely typed via
+// contentEditable) before it's interpolated into innerHTML template strings.
+function escapeHtml(s) {
+  const div = document.createElement('div');
+  div.textContent = s;
+  return div.innerHTML;
+}
+
+const FOLDER_ICON_CLOSED = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="15" height="15"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>`;
+const FOLDER_ICON_OPEN = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="15" height="15"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><polyline points="2 10 12 10 22 10"/></svg>`;
+const FOLDER_ICON_NEW = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="12" y1="13" x2="12" y2="17"/><line x1="10" y1="15" x2="14" y2="15"/></svg>`;
+
+function renderFolders() {
+  const list = document.getElementById('foldersList');
+  const allActive = activeFolderId === null;
+
+  const allNotesRow = `
+    <div class="folder-item${allActive ? ' active' : ''}" id="folderAll" onclick="selectFolder(null)">
+      ${allActive ? FOLDER_ICON_OPEN : FOLDER_ICON_CLOSED}
+      <span>All Notes</span>
+      <span class="folder-count">${notes.length}</span>
+    </div>`;
+
+  const folderRows = folders.map(f => {
+    const isActive = activeFolderId === f.id;
+    const count = notes.filter(n => n.folderId === f.id).length;
+    return `
+    <div class="folder-item${isActive ? ' active' : ''}" data-folder-id="${f.id}" onclick="selectFolder('${f.id}')">
+      ${isActive ? FOLDER_ICON_OPEN : FOLDER_ICON_CLOSED}
+      <span class="folder-name" onclick="if (this.isContentEditable) event.stopPropagation()">${escapeHtml(f.name)}</span>
+      <span class="folder-count">${count}</span>
+      <div class="folder-actions">
+        <button onclick="renameFolder('${f.id}', event)" title="Rename">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/>
+          </svg>
+        </button>
+        <button class="folder-delete-btn" onclick="deleteFolder('${f.id}', event)" title="Delete">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="3 6 5 6 21 6"/>
+            <path d="M19 6l-1 14H6L5 6"/>
+          </svg>
+        </button>
+      </div>
+    </div>`;
+  }).join('');
+
+  const newFolderBtn = `
+    <button class="btn-new-folder" onclick="createFolder()">
+      ${FOLDER_ICON_NEW}
+      <span>New Folder</span>
+    </button>`;
+
+  list.innerHTML = allNotesRow + folderRows + newFolderBtn;
+}
+
+function createFolder() {
+  const folder = {
+    id: generateId(),
+    name: 'Untitled Folder',
+    created: Date.now(),
+    updated: Date.now()
+  };
+  folders.push(folder);
+  saveFoldersLocal();
+  renderFolders();
+  upsertFolderToCloud(folder).catch(err => console.error('Folder sync failed:', err));
+  startRenameFolder(folder.id);
+}
+
+// Wrapper for the rename button's onclick — keeps the click from also
+// bubbling into the row's own onclick (which would switch folders)
+function renameFolder(id, e) {
+  e.stopPropagation();
+  startRenameFolder(id);
+}
+
+function startRenameFolder(id) {
+  const item = document.querySelector(`.folder-item[data-folder-id="${id}"] .folder-name`);
+  if (!item) return;
+  const current = item.textContent;
+  item.contentEditable = 'true';
+  item.focus();
+
+  const range = document.createRange();
+  range.selectNodeContents(item);
+  window.getSelection().removeAllRanges();
+  window.getSelection().addRange(range);
+
+  function save() {
+    item.contentEditable = 'false';
+    const newName = item.textContent.trim() || 'Untitled Folder';
+    const folder = folders.find(f => f.id === id);
+    if (folder) {
+      folder.name = newName;
+      folder.updated = Date.now();
+      saveFoldersLocal();
+      upsertFolderToCloud(folder).catch(err => console.error('Folder sync failed:', err));
+      renderFolders();
+    }
+  }
+  item.addEventListener('blur', save, { once: true });
+  item.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); item.blur(); }
+    if (e.key === 'Escape') { item.textContent = current; item.blur(); }
+  });
+}
+
+function deleteFolder(id, e) {
+  e.stopPropagation();
+  const folder = folders.find(f => f.id === id);
+  if (!folder) return;
+  const noteCount = notes.filter(n => n.folderId === id).length;
+  const msg = noteCount > 0
+    ? `Delete "${folder.name}"? The ${noteCount} note${noteCount !== 1 ? 's' : ''} inside will be moved to All Notes.`
+    : `Delete "${folder.name}"?`;
+  if (!confirm(msg)) return;
+
+  notes.forEach(n => {
+    if (n.folderId === id) {
+      n.folderId = null;
+      upsertNoteToCloud(n).catch(err => console.error('Background sync failed:', err));
+    }
+  });
+  saveNotes();
+
+  folders = folders.filter(f => f.id !== id);
+  saveFoldersLocal();
+  deleteFolderFromCloud(id).catch(err => console.error('Folder delete failed:', err));
+
+  if (activeFolderId === id) selectFolder(null); // also re-renders folders + list
+  else renderFolders();
+}
+
+function selectFolder(folderId) {
+  activeFolderId = folderId;
+  renderFolders();
+  renderList();
+}
+
+function moveNoteToFolder(noteId, folderId) {
+  const note = notes.find(n => n.id === noteId);
+  if (!note) return;
+  note.folderId = folderId;
+  note.updated = Date.now();
+  saveNotes();
+  upsertNoteToCloud(note).catch(err => console.error('Background sync failed:', err));
+  renderFolders();
+  renderList();
+  closeContextMenu();
+}
+
+// ── Note "move to folder" context menu (right-click / long-press) ──
+function buildContextMenuHTML(noteId) {
+  const items = [`<div class="context-menu-item" onclick="moveNoteToFolder('${noteId}', null)">All Notes (no folder)</div>`]
+    .concat(folders.map(f =>
+      `<div class="context-menu-item" onclick="moveNoteToFolder('${noteId}', '${f.id}')">${escapeHtml(f.name)}</div>`
+    ));
+  return `<div class="context-menu-label">Move to folder</div>${items.join('')}`;
+}
+
+function showContextMenu(e, noteId) {
+  e.preventDefault();
+  const menu = document.getElementById('contextMenu');
+  menu.innerHTML = buildContextMenuHTML(noteId);
+  menu.style.display = 'block';
+
+  // Measure first, then clamp so the menu never renders off-screen
+  const rect = menu.getBoundingClientRect();
+  const maxX = window.innerWidth - rect.width - 8;
+  const maxY = window.innerHeight - rect.height - 8;
+  menu.style.left = Math.max(8, Math.min(e.clientX, maxX)) + 'px';
+  menu.style.top = Math.max(8, Math.min(e.clientY, maxY)) + 'px';
+}
+
+function closeContextMenu() {
+  document.getElementById('contextMenu').style.display = 'none';
+}
+
+document.addEventListener('click', e => {
+  const menu = document.getElementById('contextMenu');
+  if (menu.style.display !== 'none' && !menu.contains(e.target)) closeContextMenu();
+});
+document.addEventListener('scroll', closeContextMenu, true);
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeContextMenu();
+});
+
+// Long-press (touch) opens the same context menu right-click does on desktop
+let noteLongPressTimer = null;
+let noteLongPressFired = false;
+document.getElementById('notesList').addEventListener('touchstart', e => {
+  const item = e.target.closest('.note-item');
+  if (!item) return;
+  noteLongPressFired = false;
+  const touch = e.touches[0];
+  const x = touch.clientX, y = touch.clientY;
+  noteLongPressTimer = setTimeout(() => {
+    noteLongPressFired = true;
+    showContextMenu({ clientX: x, clientY: y, preventDefault() {} }, item.dataset.noteId);
+  }, 550);
+}, { passive: true });
+['touchmove', 'touchcancel'].forEach(evt => {
+  document.getElementById('notesList').addEventListener(evt, () => clearTimeout(noteLongPressTimer));
+});
+document.getElementById('notesList').addEventListener('touchend', e => {
+  clearTimeout(noteLongPressTimer);
+  if (noteLongPressFired) {
+    e.preventDefault(); // suppress the synthetic click that would otherwise open the note
+    noteLongPressFired = false;
+  }
+});
+
 // ── Render list ──
 function renderList() {
   const list = document.getElementById('notesList');
   const filtered = notes.filter(n => {
-    if (!searchQuery) return true;
-    return (n.title || '').toLowerCase().includes(searchQuery) ||
-           (n.textData || '').toLowerCase().includes(searchQuery);
+    const folderMatch = activeFolderId === null ? true : n.folderId === activeFolderId;
+    const searchMatch = !searchQuery ||
+      (n.title || '').toLowerCase().includes(searchQuery) ||
+      (n.textData || '').toLowerCase().includes(searchQuery);
+    return folderMatch && searchMatch;
   });
 
   list.innerHTML = filtered.map(n => {
@@ -2026,7 +2424,8 @@ function renderList() {
     const hasText = !!n.textData;
     const badgeLabel = hasInk && hasText ? 'ink+text' : (hasText ? 'text' : 'ink');
     return `
-    <div class="note-item${n.id === activeId ? ' active' : ''}" onclick="selectNote('${n.id}')">
+    <div class="note-item${n.id === activeId ? ' active' : ''}" data-note-id="${n.id}"
+     onclick="selectNote('${n.id}')" oncontextmenu="showContextMenu(event, '${n.id}')">
       <div class="note-item-title">${n.title || 'Untitled'}</div>
       <div class="note-item-meta">
         <span class="note-type-badge${hasInk ? ' ink' : ''}">${badgeLabel}</span>
@@ -2429,8 +2828,11 @@ supabaseClient.auth.onAuthStateChange((event, session) => {
     document.getElementById('syncDot').className = '';
     document.getElementById('userEmail').textContent = '';
     localStorage.removeItem('inkpad_notes');
+    localStorage.removeItem('welovenote_folders');
     notes = [];
+    folders = [];
     activeId = null;
+    activeFolderId = null;
     appInitialized = false;
     document.getElementById('authEmail').value = '';
     document.getElementById('authPassword').value = '';

@@ -45,6 +45,7 @@ async function upsertNoteToCloud(note) {
       zoom: note.zoom || 1,
       pan_x: note.panX || 0,
       pan_y: note.panY || 0,
+      folder_id: note.folderId || null,
       updated_at: new Date().toISOString()
     }, { onConflict: 'id' });
 
@@ -76,7 +77,54 @@ function mapCloudNoteToLocal(cloudNote) {
     zoom: cloudNote.zoom,
     panX: cloudNote.pan_x,
     panY: cloudNote.pan_y,
+    folderId: cloudNote.folder_id || null,
     created: new Date(cloudNote.created_at).getTime(),
     updated: new Date(cloudNote.updated_at).getTime()
+  };
+}
+
+// ── Cloud folder sync — same fail-soft, fire-and-forget contract as above ──
+
+async function fetchFoldersFromCloud() {
+  if (!currentUser) return null;
+  const { data, error } = await supabaseClient
+    .from('folders')
+    .select('*')
+    .order('created_at', { ascending: true });
+  if (error) { console.error('Fetch folders failed:', error); return null; }
+  return data;
+}
+
+async function upsertFolderToCloud(folder) {
+  if (!currentUser) {
+    console.warn('No user session — skipping cloud save');
+    return;
+  }
+  const { error } = await supabaseClient
+    .from('folders')
+    .upsert({
+      id: folder.id,
+      user_id: currentUser.id,
+      name: folder.name,
+      updated_at: new Date().toISOString()
+    }, { onConflict: 'id' });
+  if (error) console.error('Folder upsert failed:', error);
+}
+
+async function deleteFolderFromCloud(folderId) {
+  if (!currentUser) return;
+  const { error } = await supabaseClient
+    .from('folders')
+    .delete()
+    .eq('id', folderId);
+  if (error) console.error('Folder delete failed:', error);
+}
+
+function mapCloudFolder(f) {
+  return {
+    id: f.id,
+    name: f.name,
+    created: new Date(f.created_at).getTime(),
+    updated: new Date(f.updated_at).getTime()
   };
 }
