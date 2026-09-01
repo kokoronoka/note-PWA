@@ -1,4 +1,4 @@
-const CACHE = 'welovenote-v3';
+const CACHE = 'welovenote-v4';
 const ASSETS = [
   '/note-PWA/',
   '/note-PWA/index.html',
@@ -36,13 +36,35 @@ self.addEventListener('fetch', e => {
   // cache.put() below throws ("Request method 'POST' is unsupported")
   if (e.request.method !== 'GET') return;
 
-  // Network-first for navigation; cache-first for static assets
-  if (e.request.mode === 'navigate') {
+  const url = new URL(e.request.url);
+
+  // Network-first for HTML and JS (code — never allowed to go stale) and any
+  // navigation request. Cache is only the offline fallback here, updated
+  // with whatever the network just returned so it stays current on every
+  // successful load. This is what the old cache-first-for-static-assets
+  // policy got wrong for db.js: a static-asset .js file cached once could
+  // silently go stale for as long as its cache entry survived, even though
+  // the file's actual content had moved on — see the now-deleted db.js and
+  // the "safeGetLocal is not defined" bug that staleness caused. Everything
+  // this app ships as code now lives in index.html itself, so this mainly
+  // guards index.html and supabase.js today, but it's the right default for
+  // any future .html/.js asset too.
+  if (url.pathname.endsWith('.html') || url.pathname.endsWith('.js') || e.request.mode === 'navigate') {
     e.respondWith(
-      fetch(e.request).catch(() => caches.match('/note-PWA/index.html'))
+      fetch(e.request)
+        .then(res => {
+          if (res.ok) {
+            const clone = res.clone();
+            caches.open(CACHE).then(c => c.put(e.request, clone));
+          }
+          return res;
+        })
+        .catch(() => caches.match(e.request).then(cached => cached || caches.match('/note-PWA/index.html')))
     );
     return;
   }
+
+  // Cache-first for everything else (fonts, icons, images)
   e.respondWith(
     caches.match(e.request).then(cached => {
       if (cached) return cached;
