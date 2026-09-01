@@ -1350,10 +1350,31 @@
 </div>
 
 <script>
+// ── Storage version migration ──
+// Bump STORAGE_VERSION whenever a future change makes an old cached
+// note/folder/pending-delete shape actively wrong (not just tolerated by
+// safeGetLocal's corruption/type guard below) — this is the blunt tool for
+// that case, clearing the cache once so the next cloud fetch rebuilds it
+// cleanly. Must run before ANY of this app's own localStorage keys are read
+// (including the very next two lines), and never touches Supabase's own
+// 'sb-*' auth keys, so a version bump never signs the user out.
+const STORAGE_VERSION = '2';
+function checkStorageVersion() {
+  const savedVersion = localStorage.getItem('welovenote_version');
+  if (savedVersion !== STORAGE_VERSION) {
+    console.log(`Storage version mismatch (${savedVersion} → ${STORAGE_VERSION}) — clearing cache`);
+    localStorage.removeItem('inkpad_notes');
+    localStorage.removeItem('welovenote_folders');
+    localStorage.removeItem('welovenote_pending_deletes');
+    localStorage.setItem('welovenote_version', STORAGE_VERSION);
+  }
+}
+checkStorageVersion();
+
 // ── State ──
-let notes = JSON.parse(localStorage.getItem('inkpad_notes') || '[]');
+let notes = safeGetLocal('inkpad_notes', []);
 let activeId = null;
-let folders = JSON.parse(localStorage.getItem('welovenote_folders') || '[]');
+let folders = safeGetLocal('welovenote_folders', []);
 let activeFolderId = null; // null = "All Notes" view
 let mode = 'type'; // 'ink' | 'type'
 let drawing = false;
@@ -1412,7 +1433,36 @@ let rafPending = false, rafHandle = null, lastMoveEvent = null;
 // copy of this user's notes wins if it has anything; otherwise (new user,
 // or the fetch failed/offline) localStorage is the fallback so the app
 // still works without a network round trip.
+//
+// initApp() itself is just a timeout race around doInitApp() — a stuck
+// network call (unreachable Supabase, a socket that never resolves either
+// way) previously left the loading screen up forever, since nothing ever
+// reached hideLoadingState(). A last-resort 15s cap guarantees the app
+// always reaches an interactive state, offline-only if it has to. Normal
+// loads finish in 2-4s and never touch this path.
 async function initApp() {
+  const TIMEOUT_MS = 15000;
+  const timeoutPromise = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error('initApp timed out')), TIMEOUT_MS)
+  );
+
+  try {
+    await Promise.race([doInitApp(), timeoutPromise]);
+  } catch (err) {
+    console.error('initApp failed or timed out:', err);
+    hideLoadingState();
+    folders = safeGetLocal('welovenote_folders', []);
+    notes = safeGetLocal('inkpad_notes', []);
+    renderFolders();
+    renderList();
+    if (notes.length === 0) createNote();
+    else selectNote(notes[0].id);
+    setSaveStatus('⚠ offline mode');
+    showToast('Could not connect — working offline. Tap 🔄 to retry sync.', 5000);
+  }
+}
+
+async function doInitApp() {
   initCanvasSize();
   showLoadingState('Loading your notes…');
 
@@ -1433,7 +1483,7 @@ async function initApp() {
     folders = cloudFolders.map(mapCloudFolder).filter(f => !pendingFolderIds.includes(f.id));
     saveFoldersLocal();
   } else {
-    folders = JSON.parse(localStorage.getItem('welovenote_folders') || '[]');
+    folders = safeGetLocal('welovenote_folders', []);
   }
 
   const cloudNotes = await fetchNotesFromCloud();
@@ -1444,7 +1494,7 @@ async function initApp() {
     notes = cloudNotes.map(mapCloudNoteToLocal).filter(n => !pendingNoteIds.includes(n.id));
     saveNotes();
   } else {
-    notes = JSON.parse(localStorage.getItem('inkpad_notes') || '[]');
+    notes = safeGetLocal('inkpad_notes', []);
   }
 
   hideLoadingState();
@@ -1455,12 +1505,77 @@ async function initApp() {
   subscribeToRealtime();
 }
 
+// Tracks the "taking too long?" helper text's timer/element so a second
+// showLoadingState() call (e.g. a retry) doesn't stack duplicates.
+let loadingHelpTimer = null;
+
 function showLoadingState(msg) {
   document.getElementById('loadingText').textContent = msg || 'Loading…';
   document.getElementById('loadingOverlay').style.display = 'flex';
+
+  clearTimeout(loadingHelpTimer);
+  const existingHelp = document.getElementById('loadingHelpText');
+  if (existingHelp) existingHelp.remove();
+
+  loadingHelpTimer = setTimeout(() => {
+    const overlay = document.getElementById('loadingOverlay');
+    if (!overlay || overlay.style.display === 'none') return;
+    const help = document.createElement('div');
+    help.id = 'loadingHelpText';
+    help.style.cssText = 'margin-top:16px;font-size:12px;color:var(--text-muted);text-align:center;';
+    help.innerHTML = `Taking too long?
+      <button onclick="clearCacheAndReload()" style="background:none;border:none;color:var(--accent);font-family:var(--font-ui);font-size:12px;cursor:pointer;text-decoration:underline;padding:0">Clear cache and reload</button>`;
+    overlay.appendChild(help);
+  }, 8000);
 }
 function hideLoadingState() {
   document.getElementById('loadingOverlay').style.display = 'none';
+  clearTimeout(loadingHelpTimer);
+  const existingHelp = document.getElementById('loadingHelpText');
+  if (existingHelp) existingHelp.remove();
+}
+
+// Last-resort recovery for a stuck load — wipes this app's own cached state
+// (never Supabase's 'sb-*' auth keys, so the user stays signed in) and
+// reloads, so the next initApp() run starts from a guaranteed-clean cache.
+function clearCacheAndReload() {
+  Object.keys(localStorage)
+    .filter(k => k.startsWith('welovenote') || k.startsWith('inkpad_'))
+    .forEach(k => localStorage.removeItem(k));
+  if ('caches' in window) {
+    caches.keys().then(keys => Promise.all(keys.map(k => caches.delete(k))));
+  }
+  window.location.reload();
+}
+
+// Small transient message for non-blocking errors (e.g. initApp's timeout
+// fallback) that shouldn't interrupt the user with a modal or alert()
+function showToast(message, duration = 3000) {
+  const existing = document.getElementById('toast');
+  if (existing) existing.remove();
+
+  const toast = document.createElement('div');
+  toast.id = 'toast';
+  toast.textContent = message;
+  toast.style.cssText = `
+    position: fixed;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 18px;
+    font-family: var(--font-ui);
+    font-size: 13px;
+    z-index: 9999;
+    box-shadow: 0 4px 20px #00000055;
+    white-space: nowrap;
+    animation: fadeIn 0.2s ease;
+  `;
+  document.body.appendChild(toast);
+  setTimeout(() => toast.remove(), duration);
 }
 
 // ── Manual / automatic re-sync (Phase 4) ──
