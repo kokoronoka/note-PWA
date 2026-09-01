@@ -616,6 +616,23 @@
     }
     .btn-signout:hover { color: var(--danger); }
 
+    .btn-refresh {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      padding: 4px;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: color 0.15s, transform 0.3s;
+      flex-shrink: 0;
+    }
+    .btn-refresh:hover { color: var(--accent); }
+    .btn-refresh.spinning svg { animation: spin 0.8s linear infinite; }
+    .btn-refresh:disabled { opacity: 0.4; cursor: not-allowed; }
+
     .user-email {
       flex: 1;
       min-width: 0; /* required for text-overflow:ellipsis to work inside a flex row */
@@ -639,6 +656,11 @@
     }
     #syncDot.connected { background: #2DB85B; } /* green = live */
     #syncDot.error { background: var(--danger); } /* red = disconnected */
+    #syncDot.syncing { background: var(--accent); animation: pulse 0.8s ease-in-out infinite; }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.4; transform: scale(0.8); }
+    }
 
     /* ── Main ── */
     .main {
@@ -1105,6 +1127,13 @@
       <div class="sidebar-footer-row">
         <span id="syncDot" title="Sync status"></span>
         <span id="userEmail" class="user-email"></span>
+        <button id="btnRefresh" class="btn-refresh" title="Sync now (Ctrl+Shift+R)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14">
+            <polyline points="23 4 23 10 17 10"/>
+            <polyline points="1 20 1 14 7 14"/>
+            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+          </svg>
+        </button>
         <button class="btn-signout" id="btnSignOut" title="Sign out">Sign out</button>
       </div>
       <span id="noteCount">0 notes</span>
@@ -1424,6 +1453,90 @@ function showLoadingState(msg) {
 function hideLoadingState() {
   document.getElementById('loadingOverlay').style.display = 'none';
 }
+
+// ── Manual / automatic re-sync (Phase 4) ──
+// Re-fetches notes and folders wholesale from the cloud, for the cases
+// realtime doesn't cover on its own: the socket was disconnected while this
+// tab was backgrounded, the device was offline, or the user just wants to
+// force a known-good state. Complements, doesn't replace, the realtime
+// subscription above.
+async function syncNow() {
+  if (!currentUser) return;
+
+  const btn = document.getElementById('btnRefresh');
+  if (btn.disabled) return; // already syncing — ignore repeat taps/triggers
+
+  const dot = document.getElementById('syncDot');
+  btn.disabled = true;
+  btn.classList.add('spinning');
+  if (dot) dot.className = 'syncing';
+  setSaveStatus('syncing…');
+
+  try {
+    const cloudFolders = await fetchFoldersFromCloud();
+    if (cloudFolders !== null) {
+      folders = cloudFolders.map(mapCloudFolder);
+      saveFoldersLocal();
+    }
+
+    const cloudNotes = await fetchNotesFromCloud();
+    if (cloudNotes !== null) {
+      notes = cloudNotes.map(mapCloudNoteToLocal);
+      saveNotes();
+    }
+
+    renderFolders();
+    renderList();
+
+    if (activeId) {
+      const stillExists = notes.find(n => n.id === activeId);
+      if (!stillExists) {
+        // Deleted on another device
+        activeId = null;
+        if (notes.length > 0) selectNote(notes[0].id);
+        else showEmpty();
+      } else if (!drawing && !userIsTyping) {
+        // Never overwrite an in-progress stroke or keystroke — same idle
+        // guard handleRealtimeChange uses before calling this
+        reloadActiveNoteContent(stillExists);
+      }
+    }
+
+    if (dot) dot.className = 'connected';
+    setSaveStatus('synced ✓');
+    setTimeout(() => setSaveStatus('saved'), 2000);
+  } catch (err) {
+    console.error('Manual sync failed:', err);
+    if (dot) dot.className = 'error';
+    setSaveStatus('sync failed');
+    setTimeout(() => setSaveStatus('saved'), 3000);
+  } finally {
+    // Minimum visible spin time so a near-instant sync still feels responsive.
+    // Only the spin/disabled state is unconditional here — the dot's final
+    // color is set above, in whichever of try/catch actually ran, so a
+    // failed sync doesn't get painted over with a false "connected" green.
+    setTimeout(() => {
+      btn.disabled = false;
+      btn.classList.remove('spinning');
+    }, 600);
+  }
+}
+
+document.getElementById('btnRefresh').addEventListener('click', syncNow);
+
+window.addEventListener('online', syncNow);
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && currentUser) syncNow();
+});
+
+document.addEventListener('keydown', e => {
+  // Ctrl/Cmd+Shift+R — deliberately not Ctrl+R, which is the browser's own hard-refresh
+  if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'r') {
+    e.preventDefault();
+    syncNow();
+  }
+});
 
 // ── Realtime sync (Phase 3) ──
 // Subscribes to postgres_changes on this user's own notes rows so edits on
@@ -2924,6 +3037,7 @@ async function bootApp() {
     document.getElementById('userEmail').textContent =
       currentUser.email || currentUser.user_metadata?.full_name || 'Signed in';
   }
+  document.getElementById('btnRefresh').style.display = currentUser ? 'flex' : 'none';
   if (!appInitialized) {
     appInitialized = true;
     await initApp();
@@ -3058,6 +3172,7 @@ supabaseClient.auth.onAuthStateChange((event, session) => {
     }
     document.getElementById('syncDot').className = '';
     document.getElementById('userEmail').textContent = '';
+    document.getElementById('btnRefresh').style.display = 'none';
     localStorage.removeItem('inkpad_notes');
     localStorage.removeItem('welovenote_folders');
     notes = [];
