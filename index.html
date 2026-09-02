@@ -1424,16 +1424,48 @@ cleanStalePendingCreates();
 // already treats this as a fire-and-forget background op and never blocks
 // the drawing/typing/localStorage path on its outcome.
 
-// Cached user, not re-fetched with getUser() on every call. getUser() always
-// makes its own network round trip, and calling it fresh from every upsert
-// was the actual cause of "second device to sign in" upserts silently
-// no-op'ing under real mobile network latency. checkSession() and
-// onAuthStateChange() below keep this in sync with the live session — by the
-// time any of these functions can be called, it's already set.
+// Cached user, kept in sync by checkSession()/onAuthStateChange() below on
+// every auth event. Reads that only need it for display (e.g. the sidebar
+// email) can use this directly. Every write below revalidates through
+// getValidUser() instead of trusting this cache — see that function's own
+// comment for why that's *not* the same footgun as calling getUser() fresh
+// on every call (a real, previously-hit bug: see git history/prior comments
+// on this line for the "second device to sign in" incident that caused).
 let currentUser = null;
 
+// getSession() (unlike getUser()) doesn't unconditionally round-trip to the
+// auth server — it reads the current session from the client's local state
+// and only refreshes the token over the network if it's actually expired or
+// close to it. That's what makes this safe to call before every write,
+// unlike the getUser()-per-call pattern the comment above warns against:
+// this stays cheap and local in the common case, and only pays for a
+// network call exactly when the session genuinely needs refreshing.
+//
+// Without this, a session that expired or was cleared out from under a long
+// -lived tab (or another tab signing out) left currentUser pointing at a
+// stale user object, so every write kept trying — and failing — against
+// Supabase's row-level security with a 401, instead of surfacing "you need
+// to sign in again."
+async function getValidUser() {
+  try {
+    const { data: { session }, error } = await supabaseClient.auth.getSession();
+    if (error || !session) {
+      console.warn('No valid session — user needs to re-login');
+      currentUser = null;
+      return null;
+    }
+    currentUser = session.user;
+    return session.user;
+  } catch (err) {
+    console.error('Session check failed:', err);
+    currentUser = null;
+    return null;
+  }
+}
+
 async function fetchNotesFromCloud() {
-  if (!currentUser) return null; // not logged in — caller falls back to localStorage
+  const user = await getValidUser();
+  if (!user) return null; // not logged in — caller falls back to localStorage
   const { data, error } = await supabaseClient
     .from('notes')
     .select('*')
@@ -1447,7 +1479,8 @@ async function fetchNotesFromCloud() {
 // to know whether a just-created item needs to stay in the pending-creates
 // queue (see addToPendingCreates) until a later retry actually confirms it.
 async function upsertNoteToCloud(note) {
-  if (!currentUser) {
+  const user = await getValidUser();
+  if (!user) {
     console.warn('No user session — skipping cloud save');
     return false;
   }
@@ -1461,7 +1494,7 @@ async function upsertNoteToCloud(note) {
       .from('notes')
       .upsert({
         id: note.id,
-        user_id: currentUser.id,
+        user_id: user.id,
         title: note.title || '',
         type: note.type || 'ink',
         text_data: note.textData || '',
@@ -1495,13 +1528,14 @@ async function upsertNoteToCloud(note) {
 // (including a thrown network error) — callers use this to decide whether
 // the delete needs to be queued and retried later (see addToPendingDeletes).
 async function deleteNoteFromCloud(noteId) {
-  if (!currentUser) return true; // not logged in — nothing to delete server-side, trust local
+  const user = await getValidUser();
+  if (!user) return true; // not logged in — nothing to delete server-side, trust local
   try {
     const { error } = await supabaseClient
       .from('notes')
       .delete()
       .eq('id', noteId)
-      .eq('user_id', currentUser.id); // extra safety: never delete a row this user doesn't own
+      .eq('user_id', user.id); // extra safety: never delete a row this user doesn't own
     if (error) { console.error('Delete failed:', error); return false; }
     return true;
   } catch (err) {
@@ -1529,7 +1563,8 @@ function mapCloudNoteToLocal(cloudNote) {
 // ── Cloud folder sync — same fail-soft, fire-and-forget contract as above ──
 
 async function fetchFoldersFromCloud() {
-  if (!currentUser) return null;
+  const user = await getValidUser();
+  if (!user) return null;
   const { data, error } = await supabaseClient
     .from('folders')
     .select('*')
@@ -1540,7 +1575,8 @@ async function fetchFoldersFromCloud() {
 
 // Same true/false contract as upsertNoteToCloud above
 async function upsertFolderToCloud(folder) {
-  if (!currentUser) {
+  const user = await getValidUser();
+  if (!user) {
     console.warn('No user session — skipping cloud save');
     return false;
   }
@@ -1549,7 +1585,7 @@ async function upsertFolderToCloud(folder) {
       .from('folders')
       .upsert({
         id: folder.id,
-        user_id: currentUser.id,
+        user_id: user.id,
         name: folder.name,
         updated_at: new Date().toISOString()
       }, { onConflict: 'id' });
@@ -1564,13 +1600,14 @@ async function upsertFolderToCloud(folder) {
 
 // Same true/false contract as deleteNoteFromCloud above
 async function deleteFolderFromCloud(folderId) {
-  if (!currentUser) return true;
+  const user = await getValidUser();
+  if (!user) return true;
   try {
     const { error } = await supabaseClient
       .from('folders')
       .delete()
       .eq('id', folderId)
-      .eq('user_id', currentUser.id);
+      .eq('user_id', user.id);
     if (error) { console.error('Folder delete failed:', error); return false; }
     return true;
   } catch (err) {
@@ -1615,7 +1652,7 @@ function removePendingDelete(id) {
 }
 
 async function flushPendingDeletes() {
-  if (!currentUser) return;
+  if (!(await getValidUser())) return;
   const pending = getPendingDeletes();
   if (pending.length === 0) return;
 
@@ -1675,7 +1712,7 @@ function cleanStalePendingCreates() {
 }
 
 async function flushPendingCreates() {
-  if (!currentUser) return;
+  if (!(await getValidUser())) return;
   const pending = getPendingCreates();
   if (pending.length === 0) return;
 
@@ -1704,6 +1741,24 @@ function reconcileWithCloud(type, cloudRaw, mapFn) {
     .filter(p => !cloudRaw.find(c => c.id === p.id))
     .map(p => p.item);
   return [...pendingCreateItems, ...mapped];
+}
+
+// Belt-and-suspenders cleanup: deleteNote()/deleteFolder() already remove a
+// matching pending create up front when deleting something that was never
+// actually synced (see there), and reconcileWithCloud() above already
+// excludes a pending create whose id is also a pending delete when merging.
+// This catches anything that slips past both of those anyway — e.g. queue
+// entries written by an older version of this code — by actually dropping
+// the contradictory create from the queue, instead of just filtering it out
+// at read time on every single merge.
+function purgeContradictoryPendingItems() {
+  const deleteIds = getPendingDeletes().map(d => d.id);
+  const creates = getPendingCreates();
+  const cleaned = creates.filter(c => !deleteIds.includes(c.id));
+  if (cleaned.length !== creates.length) {
+    localStorage.setItem(PENDING_CREATES_KEY, JSON.stringify(cleaned));
+    console.log(`Purged ${creates.length - cleaned.length} contradictory pending create(s)`);
+  }
 }
 
 // ── State ──
@@ -1800,6 +1855,11 @@ async function initApp() {
 async function doInitApp() {
   initCanvasSize();
   showLoadingState('Loading your notes…');
+
+  // Drop any queued create that's since been superseded by a queued delete
+  // for the same id (created, then deleted, before either ever synced)
+  // before touching either queue below.
+  purgeContradictoryPendingItems();
 
   // Retry any deletes that didn't confirm last time BEFORE fetching — a
   // pending delete still sitting in Supabase would otherwise come back in
@@ -1921,10 +1981,18 @@ function showToast(message, duration = 3000) {
 // force a known-good state. Complements, doesn't replace, the realtime
 // subscription above.
 async function syncNow() {
-  if (!currentUser) return;
-
   const btn = document.getElementById('btnRefresh');
   if (btn.disabled) return; // already syncing — ignore repeat taps/triggers
+
+  const user = await getValidUser();
+  if (!user) {
+    // Not just "not logged in" — this also catches a session that expired
+    // or was cleared out from under an open tab, which used to just fail
+    // every write silently with a 401 instead of telling the user why
+    showToast('Session expired — please sign in again', 4000);
+    showAuthScreen();
+    return;
+  }
 
   const dot = document.getElementById('syncDot');
   btn.disabled = true;
@@ -1933,6 +2001,10 @@ async function syncNow() {
   setSaveStatus('syncing…');
 
   try {
+    // Drop any queued create that's since been superseded by a queued
+    // delete for the same id, same reasoning as doInitApp()
+    purgeContradictoryPendingItems();
+
     // Retry any deletes still queued from a previous failed attempt before
     // fetching, same reasoning as initApp()
     await flushPendingDeletes();
@@ -2226,6 +2298,17 @@ function createNote() {
 }
 
 async function deleteNote(id) {
+  // If this note was still an unconfirmed pending create, it was never
+  // actually synced to Supabase in the first place — removing the pending
+  // create IS the delete. There's nothing server-side to delete, and
+  // queuing a pending delete for a row that never existed there would just
+  // sit in that queue forever (harmless, but pointless) while also leaving
+  // the now-orphaned pending create free to resurrect this note on the next
+  // sync's reconcileWithCloud() merge (the actual ghost-note bug this
+  // guards against).
+  const wasPendingCreate = getPendingCreates().some(p => p.id === id && p.type === 'note');
+  removePendingCreate(id);
+
   // Optimistic: local state and UI update immediately, before the cloud
   // delete even starts — the user should never wait on a network round trip
   // just to see a note disappear from the list.
@@ -2238,6 +2321,8 @@ async function deleteNote(id) {
   }
   renderFolders(); // the deleted note's folder-count badge just shrank by one
   renderList();
+
+  if (wasPendingCreate) return;
 
   // If the cloud delete doesn't confirm, queue it — otherwise the next
   // fetch would resurrect this note as a ghost (see flushPendingDeletes)
@@ -3100,6 +3185,13 @@ async function deleteFolder(id, e) {
     : `Delete "${folder.name}"?`;
   if (!confirm(msg)) return;
 
+  // Same reasoning as deleteNote() — an unconfirmed pending create was
+  // never actually synced, so removing it from the queue IS the delete;
+  // there's nothing server-side to delete and no reason to leave the
+  // now-orphaned create free to resurrect this folder on the next sync.
+  const wasPendingCreate = getPendingCreates().some(p => p.id === id && p.type === 'folder');
+  removePendingCreate(id);
+
   notes.forEach(n => {
     if (n.folderId === id) {
       n.folderId = null;
@@ -3113,6 +3205,8 @@ async function deleteFolder(id, e) {
 
   if (activeFolderId === id) selectFolder(null); // also re-renders folders + list
   else renderFolders();
+
+  if (wasPendingCreate) return;
 
   // Same optimistic-then-confirm pattern as deleteNote — queue it if the
   // cloud delete doesn't confirm, so it doesn't come back as a ghost folder
