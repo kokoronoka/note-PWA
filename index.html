@@ -1377,6 +1377,14 @@ function safeGetLocal(key, fallback = []) {
   }
 }
 
+// Declared here (not down by the rest of the pending-creates queue further
+// below) because cleanStalePendingCreates() needs it at the bottom of this
+// section, and — unlike the hoisted function declarations that use it —
+// a const is in the temporal dead zone until this exact line runs, so it
+// must physically come before that call, not just before it in some other
+// function nobody's calling yet.
+const PENDING_CREATES_KEY = 'welovenote_pending_creates';
+
 // ── Storage version migration ──
 // Bump STORAGE_VERSION whenever a future change makes an old cached
 // note/folder/pending-delete shape actively wrong (not just tolerated by
@@ -1385,7 +1393,7 @@ function safeGetLocal(key, fallback = []) {
 // cleanly. Must run before ANY of this app's own localStorage keys are read
 // (including the very next two lines), and never touches Supabase's own
 // 'sb-*' auth keys, so a version bump never signs the user out.
-const STORAGE_VERSION = '2';
+const STORAGE_VERSION = '3';
 function checkStorageVersion() {
   const savedVersion = localStorage.getItem('welovenote_version');
   if (savedVersion !== STORAGE_VERSION) {
@@ -1393,10 +1401,16 @@ function checkStorageVersion() {
     localStorage.removeItem('inkpad_notes');
     localStorage.removeItem('welovenote_folders');
     localStorage.removeItem('welovenote_pending_deletes');
+    localStorage.removeItem('welovenote_pending_creates');
     localStorage.setItem('welovenote_version', STORAGE_VERSION);
   }
 }
 checkStorageVersion();
+// Stale (>24h) queued creates indicate a permanent failure, not a transient
+// one — drop them so a broken local item can't keep resurrecting itself
+// into every future sync. Same "run before anything else uses this queue"
+// timing as checkStorageVersion() above.
+cleanStalePendingCreates();
 
 // ── Cloud sync (formerly db.js) ──
 // Moved inline from a separate db.js file: db.js was fetched as a static
@@ -1428,38 +1442,52 @@ async function fetchNotesFromCloud() {
   return data;
 }
 
+// Returns true once the row is confirmed saved in Supabase, false otherwise
+// (including a thrown network error) — createNote()/createFolder() use this
+// to know whether a just-created item needs to stay in the pending-creates
+// queue (see addToPendingCreates) until a later retry actually confirms it.
 async function upsertNoteToCloud(note) {
   if (!currentUser) {
     console.warn('No user session — skipping cloud save');
-    return;
+    return false;
   }
 
   if (note.inkData && note.inkData.length > 800 * 1024) {
     console.warn('Large ink note, consider reducing canvas size');
   }
 
-  const { error } = await supabaseClient
-    .from('notes')
-    .upsert({
-      id: note.id,
-      user_id: currentUser.id,
-      title: note.title || '',
-      type: note.type || 'ink',
-      text_data: note.textData || '',
-      ink_data: note.inkData || null,
-      zoom: note.zoom || 1,
-      pan_x: note.panX || 0,
-      pan_y: note.panY || 0,
-      folder_id: note.folderId || null,
-      updated_at: new Date().toISOString()
-    }, { onConflict: 'id' });
+  try {
+    const { error } = await supabaseClient
+      .from('notes')
+      .upsert({
+        id: note.id,
+        user_id: currentUser.id,
+        title: note.title || '',
+        type: note.type || 'ink',
+        text_data: note.textData || '',
+        ink_data: note.inkData || null,
+        zoom: note.zoom || 1,
+        pan_x: note.panX || 0,
+        pan_y: note.panY || 0,
+        folder_id: note.folderId || null,
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'id' });
 
-  if (error) {
-    console.error('Upsert failed:', error);
-    // The note is already safe in localStorage (written before this call
-    // ever runs) — this just lets the user know the cloud copy is behind
+    if (error) {
+      console.error('Upsert failed:', error);
+      // The note is already safe in localStorage (written before this call
+      // ever runs) — this just lets the user know the cloud copy is behind
+      setSaveStatus('⚠ sync failed — saved locally');
+      setTimeout(() => setSaveStatus('saved'), 4000);
+      return false;
+    }
+    removePendingCreate(note.id); // no-op if it was never queued
+    return true;
+  } catch (err) {
+    console.error('Upsert failed:', err);
     setSaveStatus('⚠ sync failed — saved locally');
     setTimeout(() => setSaveStatus('saved'), 4000);
+    return false;
   }
 }
 
@@ -1510,20 +1538,28 @@ async function fetchFoldersFromCloud() {
   return data;
 }
 
+// Same true/false contract as upsertNoteToCloud above
 async function upsertFolderToCloud(folder) {
   if (!currentUser) {
     console.warn('No user session — skipping cloud save');
-    return;
+    return false;
   }
-  const { error } = await supabaseClient
-    .from('folders')
-    .upsert({
-      id: folder.id,
-      user_id: currentUser.id,
-      name: folder.name,
-      updated_at: new Date().toISOString()
-    }, { onConflict: 'id' });
-  if (error) console.error('Folder upsert failed:', error);
+  try {
+    const { error } = await supabaseClient
+      .from('folders')
+      .upsert({
+        id: folder.id,
+        user_id: currentUser.id,
+        name: folder.name,
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'id' });
+    if (error) { console.error('Folder upsert failed:', error); return false; }
+    removePendingCreate(folder.id); // no-op if it was never queued
+    return true;
+  } catch (err) {
+    console.error('Folder upsert failed:', err);
+    return false;
+  }
 }
 
 // Same true/false contract as deleteNoteFromCloud above
@@ -1593,6 +1629,81 @@ async function flushPendingDeletes() {
       console.log(`Flushed pending delete: ${item.type} ${item.id}`);
     }
   }
+}
+
+// ── Pending creates queue ──
+// The mirror-image problem to pending deletes: create a note/folder, then
+// sync before its background upsert has confirmed with Supabase, and a
+// wholesale "notes = cloudNotes.map(...)" overwrite wipes the brand-new
+// item from both local state and localStorage — on every device, since the
+// next fetch elsewhere never had it either. Queuing it here means
+// syncNow()/doInitApp() can merge it back into whatever the cloud returns
+// (see reconcileWithCloud below) until the create actually confirms.
+// (PENDING_CREATES_KEY itself is declared up near checkStorageVersion() —
+// see the comment there for why.)
+
+function getPendingCreates() {
+  return safeGetLocal(PENDING_CREATES_KEY, []);
+}
+
+function addToPendingCreates(type, item) {
+  const pending = getPendingCreates();
+  if (!pending.find(p => p.id === item.id)) {
+    pending.push({ type, id: item.id, item, timestamp: Date.now() });
+    localStorage.setItem(PENDING_CREATES_KEY, JSON.stringify(pending));
+  }
+}
+
+function removePendingCreate(id) {
+  const updated = getPendingCreates().filter(p => p.id !== id);
+  localStorage.setItem(PENDING_CREATES_KEY, JSON.stringify(updated));
+}
+
+// A create that's been stuck for a full day points at a permanent failure
+// (bad row, RLS rejecting it, whatever) rather than a transient one — keep
+// retrying it forever would just mean silently resurrecting a broken local
+// item into every future sync. Called once, alongside checkStorageVersion(),
+// so it runs before anything else reads this queue.
+function cleanStalePendingCreates() {
+  const pending = getPendingCreates();
+  const cutoff = Date.now() - (24 * 60 * 60 * 1000);
+  const fresh = pending.filter(p => p.timestamp > cutoff);
+  if (fresh.length !== pending.length) {
+    localStorage.setItem(PENDING_CREATES_KEY, JSON.stringify(fresh));
+    console.log(`Cleaned ${pending.length - fresh.length} stale pending creates`);
+  }
+}
+
+async function flushPendingCreates() {
+  if (!currentUser) return;
+  const pending = getPendingCreates();
+  if (pending.length === 0) return;
+
+  console.log(`Flushing ${pending.length} pending create(s)`);
+  for (const entry of pending) {
+    // removePendingCreate() already happens inside upsertNoteToCloud/
+    // upsertFolderToCloud on success — nothing left to do here on a hit,
+    // and a miss just leaves it queued for the next flush.
+    if (entry.type === 'note') await upsertNoteToCloud(entry.item);
+    else if (entry.type === 'folder') await upsertFolderToCloud(entry.item);
+  }
+}
+
+// Reconciles a fresh cloud fetch with anything still in the pending-creates
+// queue: an item the cloud response doesn't have yet (its upsert is still
+// in flight, or failed and is waiting on the next flush) stays visible
+// instead of vanishing the moment the array below is replaced wholesale. A
+// pending delete for the same id always wins — the user asked to get rid
+// of it, so a still-queued create for that same id must not resurrect it.
+function reconcileWithCloud(type, cloudRaw, mapFn) {
+  const pendingDeleteIds = getPendingDeletes().filter(p => p.type === type).map(p => p.id);
+  const mapped = cloudRaw.map(mapFn).filter(item => !pendingDeleteIds.includes(item.id));
+  const pendingCreateItems = getPendingCreates()
+    .filter(p => p.type === type)
+    .filter(p => !pendingDeleteIds.includes(p.id))
+    .filter(p => !cloudRaw.find(c => c.id === p.id))
+    .map(p => p.item);
+  return [...pendingCreateItems, ...mapped];
 }
 
 // ── State ──
@@ -1695,6 +1806,11 @@ async function doInitApp() {
   // the fetches below and get treated as a legitimate note/folder again.
   await flushPendingDeletes();
 
+  // Same idea for creates: push anything still queued to the cloud BEFORE
+  // fetching, so the fetch below already has it and reconcileWithCloud()
+  // only has to cover whatever's still in flight or still failing.
+  await flushPendingCreates();
+
   // Folders load first — notes carry a folderId that only makes sense once
   // the folders array they point into already exists, so filtering/counts
   // are correct the moment renderFolders()/renderList() first run below.
@@ -1703,8 +1819,7 @@ async function doInitApp() {
     // null = fetch failed/offline → fall back to the local cache below.
     // [] is a real result (this user just has no folders yet) and must win
     // over whatever's cached locally, same as the notes fetch below.
-    const pendingFolderIds = getPendingDeletes().filter(p => p.type === 'folder').map(p => p.id);
-    folders = cloudFolders.map(mapCloudFolder).filter(f => !pendingFolderIds.includes(f.id));
+    folders = reconcileWithCloud('folder', cloudFolders, mapCloudFolder);
     saveFoldersLocal();
   } else {
     folders = safeGetLocal('welovenote_folders', []);
@@ -1712,10 +1827,7 @@ async function doInitApp() {
 
   const cloudNotes = await fetchNotesFromCloud();
   if (cloudNotes !== null) {
-    // Same ghost-filter as above: a delete that's still queued (flush just
-    // above may have failed again) must not be resurrected by this fetch.
-    const pendingNoteIds = getPendingDeletes().filter(p => p.type === 'note').map(p => p.id);
-    notes = cloudNotes.map(mapCloudNoteToLocal).filter(n => !pendingNoteIds.includes(n.id));
+    notes = reconcileWithCloud('note', cloudNotes, mapCloudNoteToLocal);
     saveNotes();
   } else {
     notes = safeGetLocal('inkpad_notes', []);
@@ -1825,17 +1937,20 @@ async function syncNow() {
     // fetching, same reasoning as initApp()
     await flushPendingDeletes();
 
+    // Same for creates — push whatever's still queued before fetching, so
+    // the fetch already has it and reconcileWithCloud() only has to cover
+    // whatever's still in flight or still failing to confirm
+    await flushPendingCreates();
+
     const cloudFolders = await fetchFoldersFromCloud();
     if (cloudFolders !== null) {
-      const pendingFolderIds = getPendingDeletes().filter(p => p.type === 'folder').map(p => p.id);
-      folders = cloudFolders.map(mapCloudFolder).filter(f => !pendingFolderIds.includes(f.id));
+      folders = reconcileWithCloud('folder', cloudFolders, mapCloudFolder);
       saveFoldersLocal();
     }
 
     const cloudNotes = await fetchNotesFromCloud();
     if (cloudNotes !== null) {
-      const pendingNoteIds = getPendingDeletes().filter(p => p.type === 'note').map(p => p.id);
-      notes = cloudNotes.map(mapCloudNoteToLocal).filter(n => !pendingNoteIds.includes(n.id));
+      notes = reconcileWithCloud('note', cloudNotes, mapCloudNoteToLocal);
       saveNotes();
     }
 
@@ -2098,12 +2213,16 @@ function createNote() {
   };
   notes.unshift(note);
   saveNotes();
-  upsertNoteToCloud(note).catch(err => console.error('Background sync failed:', err));
+  // Queue it before the upsert even starts — if the user hits sync while
+  // this is still in flight, the note stays visible instead of getting
+  // wiped by a cloud fetch that doesn't have it yet (see reconcileWithCloud)
+  addToPendingCreates('note', note);
   renderFolders(); // folder-count badge for note.folderId just grew by one
   renderList();
   selectNote(note.id); // selectNote() saves the outgoing note, then clears the textarea before loading this one
   // Focus title
   setTimeout(() => document.getElementById('noteTitleInput').focus(), 50);
+  upsertNoteToCloud(note); // removePendingCreate() happens inside on success
 }
 
 async function deleteNote(id) {
@@ -2926,7 +3045,10 @@ function createFolder() {
   folders.push(folder);
   saveFoldersLocal();
   renderFolders();
-  upsertFolderToCloud(folder).catch(err => console.error('Folder sync failed:', err));
+  // Same reasoning as createNote() — queue before the upsert starts, so a
+  // sync mid-flight can't wipe this folder before it's confirmed
+  addToPendingCreates('folder', folder);
+  upsertFolderToCloud(folder); // removePendingCreate() happens inside on success
   startRenameFolder(folder.id);
 }
 
@@ -3545,6 +3667,12 @@ supabaseClient.auth.onAuthStateChange((event, session) => {
     document.getElementById('btnRefresh').style.display = 'none';
     localStorage.removeItem('inkpad_notes');
     localStorage.removeItem('welovenote_folders');
+    // A queued create/delete left behind for a different account signing in
+    // on this same device would flush against THAT account instead — a
+    // pending create in particular would silently push this user's cached
+    // note content into the next signed-in account's data.
+    localStorage.removeItem('welovenote_pending_deletes');
+    localStorage.removeItem('welovenote_pending_creates');
     notes = [];
     folders = [];
     activeId = null;
