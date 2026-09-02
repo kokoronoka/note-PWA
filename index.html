@@ -2000,6 +2000,15 @@ async function syncNow() {
   if (dot) dot.className = 'syncing';
   setSaveStatus('syncing…');
 
+  // TEMPORARY tracing for the note-resurrection bug — remove once confirmed
+  // fixed. Reads the same pending-queue/cloud state reconcileWithCloud()
+  // below actually uses, so this shows exactly what decision it's making
+  // without duplicating (and risking diverging from) its actual logic.
+  console.log('=== SYNC START ===');
+  console.log('Local notes before sync:', notes.map(n => n.id));
+  console.log('Pending deletes:', getPendingDeletes());
+  console.log('Pending creates:', getPendingCreates());
+
   try {
     // Drop any queued create that's since been superseded by a queued
     // delete for the same id, same reasoning as doInitApp()
@@ -2021,10 +2030,17 @@ async function syncNow() {
     }
 
     const cloudNotes = await fetchNotesFromCloud();
+    console.log('Cloud notes returned:', cloudNotes?.map(n => n.id));
+    console.log('Pending delete IDs to filter out:', getPendingDeletes().map(p => p.id));
+    console.log('Pending note creates still queued:', getPendingCreates().filter(p => p.type === 'note').map(p => p.id));
+
     if (cloudNotes !== null) {
       notes = reconcileWithCloud('note', cloudNotes, mapCloudNoteToLocal);
       saveNotes();
     }
+
+    console.log('Final notes after sync:', notes.map(n => n.id));
+    console.log('=== SYNC END ===');
 
     renderFolders();
     renderList();
@@ -3720,9 +3736,17 @@ btnGoogleSignIn.addEventListener('click', async () => {
 
   const { error } = await supabaseClient.auth.signInWithOAuth({
     provider: 'google',
-    // Dynamic, never hardcoded — works on GitHub Pages (with its /reponame/
-    // subpath) and local dev alike, since it's derived from the page itself.
-    options: { redirectTo: window.location.origin + window.location.pathname }
+    options: {
+      // Dynamic, never hardcoded — works on GitHub Pages (with its
+      // /reponame/ subpath) and local dev alike, derived from the page itself.
+      redirectTo: window.location.origin + window.location.pathname,
+      // Without this, Google silently reuses the browser's last Google
+      // session and skips the account picker entirely — so switching
+      // accounts (or signing out and back in as someone else) would sign
+      // this app back in as whichever Google account was used last, not
+      // whichever one the user actually meant to pick.
+      queryParams: { prompt: 'select_account' }
+    }
   });
 
   if (error) {
@@ -3734,14 +3758,55 @@ btnGoogleSignIn.addEventListener('click', async () => {
   // onAuthStateChange listener (SIGNED_IN) picks up from there via bootApp()
 });
 
-document.getElementById('btnSignOut').addEventListener('click', async () => {
+async function handleSignOut() {
   if (realtimeChannel) {
     supabaseClient.removeChannel(realtimeChannel);
     realtimeChannel = null;
   }
-  await supabaseClient.auth.signOut();
-  // onAuthStateChange below handles clearing notes and showing the auth screen
-});
+
+  // Clear in-memory state immediately, rather than waiting on the
+  // onAuthStateChange round trip below — that listener does this same
+  // cleanup too (see its own comment), but only reliably covers the
+  // "session expired/signed out elsewhere" case; an explicit sign-out click
+  // here shouldn't have to wait on it to feel instant.
+  notes = [];
+  folders = [];
+  activeId = null;
+  activeFolderId = null;
+  currentUser = null;
+
+  // This app's own cached state. Supabase's 'sb-*' keys are cleared by
+  // signOut() itself below, not here — a queued create/delete left behind
+  // for this account would otherwise flush against whichever account signs
+  // in next on this device.
+  localStorage.removeItem('inkpad_notes');
+  localStorage.removeItem('welovenote_folders');
+  localStorage.removeItem('welovenote_pending_deletes');
+  localStorage.removeItem('welovenote_pending_creates');
+
+  // scope: 'global' signs this session out everywhere (every tab/device),
+  // not just this tab — an explicit "sign out" here shouldn't leave a
+  // session alive elsewhere that a next sign-in could somehow inherit.
+  const { error } = await supabaseClient.auth.signOut({ scope: 'global' });
+  if (error) console.error('Sign out error:', error);
+
+  // Defense in depth: signOut() is expected to have cleared its own 'sb-*'
+  // keys by now — this only steps in if that somehow didn't happen, so a
+  // stale session can't silently carry over into the next sign-in attempt.
+  const { data: { session } } = await supabaseClient.auth.getSession();
+  if (session) {
+    console.error('Session still exists after signOut! Forcing local session removal');
+    Object.keys(localStorage)
+      .filter(k => k.startsWith('sb-'))
+      .forEach(k => localStorage.removeItem(k));
+  }
+
+  showAuthScreen();
+  // onAuthStateChange below still runs too and repeats some of this — see
+  // its own comment for why that's necessary, not just redundant.
+}
+
+document.getElementById('btnSignOut').addEventListener('click', handleSignOut);
 
 supabaseClient.auth.onAuthStateChange((event, session) => {
   // Kept in sync on every auth event (including the INITIAL_SESSION one
