@@ -1463,6 +1463,61 @@ async function getValidUser() {
   }
 }
 
+// A device clock that's drifted noticeably from real time makes Supabase
+// auth's JWT expiry/issued-at checks fail in confusing ways — every write
+// gets rejected by row-level security (see isRLSViolation below) with
+// nothing in the UI hinting that the actual cause is "your clock is wrong,"
+// not "you're not allowed to do this." Compares local time against the
+// Date header any HTTP response carries (no auth needed to read it, so this
+// works even for a fully signed-out visitor) as a cheap, no-dependency way
+// to catch that before it manifests as a pile of write failures.
+async function checkClockSkew() {
+  try {
+    const response = await fetch(`${SUPABASE_URL}/rest/v1/`, {
+      method: 'HEAD',
+      headers: { apikey: SUPABASE_ANON_KEY }
+    });
+    const serverDateHeader = response.headers.get('date');
+    if (!serverDateHeader) return false;
+
+    const serverTime = new Date(serverDateHeader).getTime();
+    const localTime = Date.now();
+    const skewMs = Math.abs(serverTime - localTime);
+    const skewMinutes = skewMs / 1000 / 60;
+
+    if (skewMinutes > 5) {
+      console.error(`Clock skew detected: device is ${skewMinutes.toFixed(1)} minutes off from server time`);
+      showToast('⚠ Your device clock appears incorrect. This can cause sync failures. Please check your date & time settings.', 8000);
+      return true; // skew detected
+    }
+    return false;
+  } catch (err) {
+    console.warn('Could not check clock skew:', err);
+    return false;
+  }
+}
+
+// A 42501 (insufficient_privilege) error, or a message naming the RLS
+// policy explicitly, almost always means the JWT Supabase is sending along
+// is stale or clock-skewed, not that the write is genuinely disallowed by
+// policy — refreshing the session and pointing the user at their device
+// clock is far more actionable than the generic "sync failed" every other
+// write error gets.
+function isRLSViolation(error) {
+  return error?.code === '42501' ||
+    (error?.message && error.message.includes('row-level security policy'));
+}
+
+async function handleRLSViolation() {
+  console.error('RLS violation — likely clock skew or expired session. Forcing session refresh.');
+  try {
+    await supabaseClient.auth.refreshSession();
+  } catch (err) {
+    console.error('Session refresh failed:', err);
+  }
+  showToast('⚠ Sync error — please check your device clock is correct, or try signing out and back in.', 6000);
+}
+
 async function fetchNotesFromCloud() {
   const user = await getValidUser();
   if (!user) return null; // not logged in — caller falls back to localStorage
@@ -1508,10 +1563,14 @@ async function upsertNoteToCloud(note) {
 
     if (error) {
       console.error('Upsert failed:', error);
-      // The note is already safe in localStorage (written before this call
-      // ever runs) — this just lets the user know the cloud copy is behind
-      setSaveStatus('⚠ sync failed — saved locally');
-      setTimeout(() => setSaveStatus('saved'), 4000);
+      if (isRLSViolation(error)) {
+        await handleRLSViolation();
+      } else {
+        // The note is already safe in localStorage (written before this
+        // call ever runs) — this just lets the user know the cloud copy is behind
+        setSaveStatus('⚠ sync failed — saved locally');
+        setTimeout(() => setSaveStatus('saved'), 4000);
+      }
       return false;
     }
     removePendingCreate(note.id); // no-op if it was never queued
@@ -1536,7 +1595,11 @@ async function deleteNoteFromCloud(noteId) {
       .delete()
       .eq('id', noteId)
       .eq('user_id', user.id); // extra safety: never delete a row this user doesn't own
-    if (error) { console.error('Delete failed:', error); return false; }
+    if (error) {
+      console.error('Delete failed:', error);
+      if (isRLSViolation(error)) await handleRLSViolation();
+      return false;
+    }
     return true;
   } catch (err) {
     console.error('Delete failed:', err);
@@ -1589,7 +1652,11 @@ async function upsertFolderToCloud(folder) {
         name: folder.name,
         updated_at: new Date().toISOString()
       }, { onConflict: 'id' });
-    if (error) { console.error('Folder upsert failed:', error); return false; }
+    if (error) {
+      console.error('Folder upsert failed:', error);
+      if (isRLSViolation(error)) await handleRLSViolation();
+      return false;
+    }
     removePendingCreate(folder.id); // no-op if it was never queued
     return true;
   } catch (err) {
@@ -1608,7 +1675,11 @@ async function deleteFolderFromCloud(folderId) {
       .delete()
       .eq('id', folderId)
       .eq('user_id', user.id);
-    if (error) { console.error('Folder delete failed:', error); return false; }
+    if (error) {
+      console.error('Folder delete failed:', error);
+      if (isRLSViolation(error)) await handleRLSViolation();
+      return false;
+    }
     return true;
   } catch (err) {
     console.error('Folder delete failed:', err);
@@ -1711,6 +1782,56 @@ function cleanStalePendingCreates() {
   }
 }
 
+// ── Per-item sync failure tracking ──
+// A pending create that keeps failing sync after sync (as opposed to one
+// still waiting on its very first retry) is worth surfacing more insistently
+// than the transient toasts above — see showPersistentSyncWarning below.
+const FAILURE_COUNTS_KEY = 'welovenote_failure_counts';
+
+function getPendingCreateFailureCount(id) {
+  const counts = safeGetLocal(FAILURE_COUNTS_KEY, {});
+  return counts[id] || 0;
+}
+
+function incrementPendingCreateFailure(id) {
+  const counts = safeGetLocal(FAILURE_COUNTS_KEY, {});
+  counts[id] = (counts[id] || 0) + 1;
+  localStorage.setItem(FAILURE_COUNTS_KEY, JSON.stringify(counts));
+  return counts[id];
+}
+
+function clearPendingCreateFailure(id) {
+  const counts = safeGetLocal(FAILURE_COUNTS_KEY, {});
+  delete counts[id];
+  localStorage.setItem(FAILURE_COUNTS_KEY, JSON.stringify(counts));
+}
+
+// Unlike showToast() (auto-dismisses, easy to miss), this stays up top until
+// the user notices and taps it away — reserved for "this has been stuck for
+// a while," not every transient sync hiccup.
+function showPersistentSyncWarning(message) {
+  let banner = document.getElementById('syncWarningBanner');
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'syncWarningBanner';
+    banner.style.cssText = `
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      background: var(--danger);
+      color: white;
+      text-align: center;
+      padding: 8px 16px;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      z-index: 10000;
+      cursor: pointer;
+    `;
+    banner.addEventListener('click', () => banner.remove());
+    document.body.appendChild(banner);
+  }
+  banner.textContent = message + ' (tap to dismiss)';
+}
+
 async function flushPendingCreates() {
   if (!(await getValidUser())) return;
   const pending = getPendingCreates();
@@ -1718,11 +1839,34 @@ async function flushPendingCreates() {
 
   console.log(`Flushing ${pending.length} pending create(s)`);
   for (const entry of pending) {
-    // removePendingCreate() already happens inside upsertNoteToCloud/
-    // upsertFolderToCloud on success — nothing left to do here on a hit,
-    // and a miss just leaves it queued for the next flush.
-    if (entry.type === 'note') await upsertNoteToCloud(entry.item);
-    else if (entry.type === 'folder') await upsertFolderToCloud(entry.item);
+    let success = entry.type === 'note'
+      ? await upsertNoteToCloud(entry.item)
+      : await upsertFolderToCloud(entry.item);
+
+    if (!success) {
+      // One retry after a fresh session refresh — the most common
+      // transient cause (a stale or clock-skewed token) is exactly what
+      // this fixes, and RLS failures already trigger a refresh of their
+      // own inside upsertNoteToCloud/upsertFolderToCloud, so this mainly
+      // helps the non-RLS-shaped transient failures.
+      try { await supabaseClient.auth.refreshSession(); } catch (err) { console.error('Session refresh failed:', err); }
+      success = entry.type === 'note'
+        ? await upsertNoteToCloud(entry.item)
+        : await upsertFolderToCloud(entry.item);
+    }
+
+    if (success) {
+      // removePendingCreate() already happened inside upsertNoteToCloud/
+      // upsertFolderToCloud — just the failure-count bookkeeping left here.
+      clearPendingCreateFailure(entry.id);
+      console.log(`Flushed pending create: ${entry.type} ${entry.id}`);
+    } else {
+      console.warn(`Still failing after retry: ${entry.type} ${entry.id}`);
+      const failCount = incrementPendingCreateFailure(entry.id);
+      if (failCount >= 3) {
+        showPersistentSyncWarning(`A ${entry.type} is stuck syncing. Check your device clock and internet connection, or try signing out and back in.`);
+      }
+    }
   }
 }
 
@@ -1855,6 +1999,10 @@ async function initApp() {
 async function doInitApp() {
   initCanvasSize();
   showLoadingState('Loading your notes…');
+
+  // Fire and forget — a wrong device clock is worth warning about, but
+  // checking for it must never hold up the actual note load below
+  checkClockSkew();
 
   // Drop any queued create that's since been superseded by a queued delete
   // for the same id (created, then deleted, before either ever synced)
