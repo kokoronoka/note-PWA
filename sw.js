@@ -1,4 +1,4 @@
-const CACHE = 'welovenote-v5';
+const CACHE = 'welovenote-v6';
 const ASSETS = [
   '/note-PWA/',
   '/note-PWA/index.html',
@@ -50,6 +50,22 @@ function safeCachePut(cache, request, response) {
 
 self.addEventListener('fetch', e => {
   const url = new URL(e.request.url);
+
+  // NEVER intercept Supabase API or Auth requests — these must always hit
+  // the network directly for real-time data accuracy. Everything below this
+  // point (including the "cache-first for everything else" branch meant for
+  // fonts/icons) has no path/extension check that would otherwise exclude
+  // a REST API call like GET /rest/v1/notes — its URL doesn't end in
+  // .html/.js and its request mode isn't 'navigate', so without this early
+  // exit it falls into cache-first: the first fetchNotesFromCloud() call
+  // gets cached, and every identical query after that — which is all of
+  // them, same URL every time — silently serves that stale snapshot instead
+  // of hitting the network. That's what let a deleted note keep reappearing
+  // even after deleteNoteFromCloud() confirmed the delete really happened.
+  if (url.hostname.endsWith('.supabase.co')) {
+    console.log('[SW] Bypassing cache for Supabase request:', url.pathname); // TEMP — remove once confirmed fixed
+    return; // let the browser handle it normally, no caching
+  }
 
   // Only handle http/https requests — chrome-extension:, data:, blob:, etc.
   // are never ours to cache and safeCachePut() would just no-op on them
