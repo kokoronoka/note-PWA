@@ -1473,9 +1473,21 @@ async function getValidUser() {
 // to catch that before it manifests as a pile of write failures.
 async function checkClockSkew() {
   try {
-    const response = await fetch(`${SUPABASE_URL}/rest/v1/`, {
+    // The bare API root (/rest/v1/ with no table) 401s here regardless of
+    // headers — this project has its OpenAPI root disabled, which is a
+    // separate project setting from auth entirely, not something a header
+    // fixes. A real table endpoint is what actually works: confirmed live
+    // against this project that apikey alone is sufficient for a HEAD on
+    // notes (200, with the date header present and exposed) while the bare
+    // root 401s even with both apikey and Authorization set. Authorization
+    // is included anyway to match what the Supabase client itself always
+    // sends, in case that requirement varies across projects/policies.
+    const response = await fetch(`${SUPABASE_URL}/rest/v1/notes?select=id&limit=1`, {
       method: 'HEAD',
-      headers: { apikey: SUPABASE_ANON_KEY }
+      headers: {
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${SUPABASE_ANON_KEY}`
+      }
     });
     const serverDateHeader = response.headers.get('date');
     if (!serverDateHeader) return false;
