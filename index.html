@@ -1557,7 +1557,17 @@ async function upsertNoteToCloud(note) {
   }
 
   try {
-    const { error } = await supabaseClient
+    // .select() is required to actually verify the write — without it,
+    // .upsert() can report a null error while affecting ZERO rows: this
+    // compiles to INSERT ... ON CONFLICT (id) DO UPDATE, and if a row with
+    // this id already exists under a user_id this session's RLS policy
+    // doesn't match, the UPDATE branch is silently filtered to zero rows by
+    // RLS — Postgres doesn't treat "UPDATE matched nothing" as an error, and
+    // RLS filtering an UPDATE target isn't a policy-violation error either.
+    // That let removePendingCreate() fire for a note that was never
+    // actually persisted — this is the confirmed root cause of the
+    // note-resurrection bug traced via the sync logging above.
+    const { data, error } = await supabaseClient
       .from('notes')
       .upsert({
         id: note.id,
@@ -1571,7 +1581,8 @@ async function upsertNoteToCloud(note) {
         pan_y: note.panY || 0,
         folder_id: note.folderId || null,
         updated_at: new Date().toISOString()
-      }, { onConflict: 'id' });
+      }, { onConflict: 'id' })
+      .select();
 
     if (error) {
       console.error('Upsert failed:', error);
@@ -1583,6 +1594,14 @@ async function upsertNoteToCloud(note) {
         setSaveStatus('⚠ sync failed — saved locally');
         setTimeout(() => setSaveStatus('saved'), 4000);
       }
+      return false;
+    }
+    if (!data || data.length === 0) {
+      // No error, but no row came back either — the write silently affected
+      // nothing. Treat exactly like an RLS violation: same likely cause
+      // (stale/skewed token), same recovery (refresh + tell the user).
+      console.error('Upsert returned no error but affected 0 rows — treating as RLS/auth failure:', note.id);
+      await handleRLSViolation();
       return false;
     }
     removePendingCreate(note.id); // no-op if it was never queued
@@ -1600,21 +1619,36 @@ async function upsertNoteToCloud(note) {
 // the delete needs to be queued and retried later (see addToPendingDeletes).
 async function deleteNoteFromCloud(noteId) {
   const user = await getValidUser();
-  if (!user) return true; // not logged in — nothing to delete server-side, trust local
+  if (!user) {
+    console.log('[delete] no valid user, skipping cloud delete');
+    return true; // not logged in — nothing to delete server-side, trust local
+  }
   try {
-    const { error } = await supabaseClient
+    // count: 'exact' is what actually tells us whether the DELETE affected
+    // a real row, vs. matching nothing — the two cases this is diagnosing:
+    // a delete that never reaches Supabase (bug on this device) vs. one
+    // that reaches it but doesn't affect a row (already gone, or a
+    // note_id/user_id mismatch — including the RLS-silent-no-op scenario
+    // upsertNoteToCloud can hit).
+    const { error, count } = await supabaseClient
       .from('notes')
-      .delete()
+      .delete({ count: 'exact' })
       .eq('id', noteId)
       .eq('user_id', user.id); // extra safety: never delete a row this user doesn't own
+
+    console.log('[delete] result:', { error, count, noteId });
+
     if (error) {
-      console.error('Delete failed:', error);
+      console.error('[delete] failed:', error);
       if (isRLSViolation(error)) await handleRLSViolation();
       return false;
     }
+    if (count === 0) {
+      console.warn('[delete] no rows deleted — note may not exist in cloud (already gone, or was never actually persisted — see upsertNoteToCloud), or RLS blocked it silently');
+    }
     return true;
   } catch (err) {
-    console.error('Delete failed:', err);
+    console.error('[delete] threw:', err);
     return false;
   }
 }
@@ -1656,17 +1690,26 @@ async function upsertFolderToCloud(folder) {
     return false;
   }
   try {
-    const { error } = await supabaseClient
+    // .select() required to verify the write actually affected a row — see
+    // the matching comment in upsertNoteToCloud for why a null error alone
+    // isn't proof of that.
+    const { data, error } = await supabaseClient
       .from('folders')
       .upsert({
         id: folder.id,
         user_id: user.id,
         name: folder.name,
         updated_at: new Date().toISOString()
-      }, { onConflict: 'id' });
+      }, { onConflict: 'id' })
+      .select();
     if (error) {
       console.error('Folder upsert failed:', error);
       if (isRLSViolation(error)) await handleRLSViolation();
+      return false;
+    }
+    if (!data || data.length === 0) {
+      console.error('Folder upsert returned no error but affected 0 rows — treating as RLS/auth failure:', folder.id);
+      await handleRLSViolation();
       return false;
     }
     removePendingCreate(folder.id); // no-op if it was never queued
@@ -1677,24 +1720,34 @@ async function upsertFolderToCloud(folder) {
   }
 }
 
-// Same true/false contract as deleteNoteFromCloud above
+// Same true/false contract, and same { count: 'exact' } tracing, as
+// deleteNoteFromCloud above
 async function deleteFolderFromCloud(folderId) {
   const user = await getValidUser();
-  if (!user) return true;
+  if (!user) {
+    console.log('[delete] no valid user, skipping cloud folder delete');
+    return true;
+  }
   try {
-    const { error } = await supabaseClient
+    const { error, count } = await supabaseClient
       .from('folders')
-      .delete()
+      .delete({ count: 'exact' })
       .eq('id', folderId)
       .eq('user_id', user.id);
+
+    console.log('[delete] folder result:', { error, count, folderId });
+
     if (error) {
-      console.error('Folder delete failed:', error);
+      console.error('[delete] folder failed:', error);
       if (isRLSViolation(error)) await handleRLSViolation();
       return false;
     }
+    if (count === 0) {
+      console.warn('[delete] no folder rows deleted — folder may not exist in cloud, or RLS blocked it silently');
+    }
     return true;
   } catch (err) {
-    console.error('Folder delete failed:', err);
+    console.error('[delete] folder threw:', err);
     return false;
   }
 }
@@ -1758,7 +1811,7 @@ async function flushPendingDeletes() {
 // item from both local state and localStorage — on every device, since the
 // next fetch elsewhere never had it either. Queuing it here means
 // syncNow()/doInitApp() can merge it back into whatever the cloud returns
-// (see reconcileWithCloud below) until the create actually confirms.
+// (see reconcileNotes/reconcileFolders below) until the create actually confirms.
 // (PENDING_CREATES_KEY itself is declared up near checkStorageVersion() —
 // see the comment there for why.)
 
@@ -1882,31 +1935,68 @@ async function flushPendingCreates() {
   }
 }
 
-// Reconciles a fresh cloud fetch with anything still in the pending-creates
-// queue: an item the cloud response doesn't have yet (its upsert is still
-// in flight, or failed and is waiting on the next flush) stays visible
-// instead of vanishing the moment the array below is replaced wholesale. A
-// pending delete for the same id always wins — the user asked to get rid
-// of it, so a still-queued create for that same id must not resurrect it.
-function reconcileWithCloud(type, cloudRaw, mapFn) {
-  const pendingDeleteIds = getPendingDeletes().filter(p => p.type === type).map(p => p.id);
-  const mapped = cloudRaw.map(mapFn).filter(item => !pendingDeleteIds.includes(item.id));
-  const pendingCreateItems = getPendingCreates()
-    .filter(p => p.type === type)
-    .filter(p => !pendingDeleteIds.includes(p.id))
-    .filter(p => !cloudRaw.find(c => c.id === p.id))
-    .map(p => p.item);
-  return [...pendingCreateItems, ...mapped];
+// Single source of truth for merging a cloud fetch with local state, for
+// both syncNow() and doInitApp(). Deliberately does NOT lean on the
+// pending-creates queue to decide what survives — it compares local notes
+// against the cloud response directly. The queue can drift (a create can
+// get marked "confirmed" by a false-positive success — see upsertNoteToCloud
+// for the RLS-silent-no-op case that motivated this), so the guarantee here
+// is enforced structurally instead: any local note not literally present in
+// cloudNotes AND not in pendingDeletes is preserved, full stop, regardless
+// of what the queue thinks happened to it.
+function reconcileNotes(localNotes, cloudNotes, pendingDeletes) {
+  const cloudIds = new Set(cloudNotes.map(n => n.id));
+  const deleteIds = new Set(pendingDeletes.filter(d => d.type === 'note').map(d => d.id));
+
+  // Notes confirmed to exist in cloud (minus anything pending delete
+  // locally — respects user intent even if the cloud delete hasn't
+  // propagated yet)
+  const fromCloud = cloudNotes
+    .map(mapCloudNoteToLocal)
+    .filter(n => !deleteIds.has(n.id));
+
+  // Local notes not yet confirmed in cloud and not pending delete — these
+  // MUST survive the sync
+  const unconfirmedLocal = localNotes.filter(n =>
+    !cloudIds.has(n.id) && !deleteIds.has(n.id)
+  );
+
+  console.log('[reconcile] from cloud:', fromCloud.map(n => n.id));
+  console.log('[reconcile] unconfirmed local (preserved):', unconfirmedLocal.map(n => n.id));
+
+  return [...unconfirmedLocal, ...fromCloud];
+}
+
+// Identical rule, applied to folders.
+function reconcileFolders(localFolders, cloudFolders, pendingDeletes) {
+  const cloudIds = new Set(cloudFolders.map(f => f.id));
+  const deleteIds = new Set(pendingDeletes.filter(d => d.type === 'folder').map(d => d.id));
+
+  const fromCloud = cloudFolders
+    .map(mapCloudFolder)
+    .filter(f => !deleteIds.has(f.id));
+
+  const unconfirmedLocal = localFolders.filter(f =>
+    !cloudIds.has(f.id) && !deleteIds.has(f.id)
+  );
+
+  console.log('[reconcile] folders from cloud:', fromCloud.map(f => f.id));
+  console.log('[reconcile] unconfirmed local folders (preserved):', unconfirmedLocal.map(f => f.id));
+
+  return [...unconfirmedLocal, ...fromCloud];
 }
 
 // Belt-and-suspenders cleanup: deleteNote()/deleteFolder() already remove a
 // matching pending create up front when deleting something that was never
-// actually synced (see there), and reconcileWithCloud() above already
-// excludes a pending create whose id is also a pending delete when merging.
-// This catches anything that slips past both of those anyway — e.g. queue
-// entries written by an older version of this code — by actually dropping
-// the contradictory create from the queue, instead of just filtering it out
-// at read time on every single merge.
+// actually synced (see there) — reconcileNotes()/reconcileFolders() above
+// don't need their own "delete beats create" filter for this because they
+// work off localNotes/localFolders directly, and an optimistically-deleted
+// item is already gone from those arrays by the time either function runs.
+// This purge is for what neither of those cover: a pending create left
+// queued for an id that's ALSO pending delete (e.g. queue entries written
+// by an older version of this code, before deleteNote() did this cleanup
+// itself). Left alone, flushPendingCreates() would still try to re-upload
+// it — wasted work at best, resurrecting a deleted row at worst.
 function purgeContradictoryPendingItems() {
   const deleteIds = getPendingDeletes().map(d => d.id);
   const creates = getPendingCreates();
@@ -2027,8 +2117,9 @@ async function doInitApp() {
   await flushPendingDeletes();
 
   // Same idea for creates: push anything still queued to the cloud BEFORE
-  // fetching, so the fetch below already has it and reconcileWithCloud()
-  // only has to cover whatever's still in flight or still failing.
+  // fetching, so the fetch below already has it and reconcileNotes()/
+  // reconcileFolders() only have to cover whatever's still in flight or
+  // still failing.
   await flushPendingCreates();
 
   // Folders load first — notes carry a folderId that only makes sense once
@@ -2039,7 +2130,7 @@ async function doInitApp() {
     // null = fetch failed/offline → fall back to the local cache below.
     // [] is a real result (this user just has no folders yet) and must win
     // over whatever's cached locally, same as the notes fetch below.
-    folders = reconcileWithCloud('folder', cloudFolders, mapCloudFolder);
+    folders = reconcileFolders(folders, cloudFolders, getPendingDeletes());
     saveFoldersLocal();
   } else {
     folders = safeGetLocal('welovenote_folders', []);
@@ -2047,7 +2138,7 @@ async function doInitApp() {
 
   const cloudNotes = await fetchNotesFromCloud();
   if (cloudNotes !== null) {
-    notes = reconcileWithCloud('note', cloudNotes, mapCloudNoteToLocal);
+    notes = reconcileNotes(notes, cloudNotes, getPendingDeletes());
     saveNotes();
   } else {
     notes = safeGetLocal('inkpad_notes', []);
@@ -2161,9 +2252,8 @@ async function syncNow() {
   setSaveStatus('syncing…');
 
   // TEMPORARY tracing for the note-resurrection bug — remove once confirmed
-  // fixed. Reads the same pending-queue/cloud state reconcileWithCloud()
-  // below actually uses, so this shows exactly what decision it's making
-  // without duplicating (and risking diverging from) its actual logic.
+  // fixed. reconcileNotes()/reconcileFolders() below log their own
+  // [reconcile] lines showing exactly what they kept and why.
   console.log('=== SYNC START ===');
   console.log('Local notes before sync:', notes.map(n => n.id));
   console.log('Pending deletes:', getPendingDeletes());
@@ -2179,13 +2269,13 @@ async function syncNow() {
     await flushPendingDeletes();
 
     // Same for creates — push whatever's still queued before fetching, so
-    // the fetch already has it and reconcileWithCloud() only has to cover
-    // whatever's still in flight or still failing to confirm
+    // the fetch already has it and reconcileNotes()/reconcileFolders() only
+    // have to cover whatever's still in flight or still failing to confirm
     await flushPendingCreates();
 
     const cloudFolders = await fetchFoldersFromCloud();
     if (cloudFolders !== null) {
-      folders = reconcileWithCloud('folder', cloudFolders, mapCloudFolder);
+      folders = reconcileFolders(folders, cloudFolders, getPendingDeletes());
       saveFoldersLocal();
     }
 
@@ -2195,7 +2285,7 @@ async function syncNow() {
     console.log('Pending note creates still queued:', getPendingCreates().filter(p => p.type === 'note').map(p => p.id));
 
     if (cloudNotes !== null) {
-      notes = reconcileWithCloud('note', cloudNotes, mapCloudNoteToLocal);
+      notes = reconcileNotes(notes, cloudNotes, getPendingDeletes());
       saveNotes();
     }
 
@@ -2461,9 +2551,11 @@ function createNote() {
   };
   notes.unshift(note);
   saveNotes();
-  // Queue it before the upsert even starts — if the user hits sync while
-  // this is still in flight, the note stays visible instead of getting
-  // wiped by a cloud fetch that doesn't have it yet (see reconcileWithCloud)
+  // Queue it before the upsert even starts. Surviving a sync that runs
+  // before this confirms is guaranteed structurally now — reconcileNotes()
+  // preserves any local note not yet in the cloud response, independent of
+  // this queue — but the queue itself is still what tells flushPendingCreates()
+  // there's something here worth retrying.
   addToPendingCreates('note', note);
   renderFolders(); // folder-count badge for note.folderId just grew by one
   renderList();
@@ -2479,9 +2571,8 @@ async function deleteNote(id) {
   // create IS the delete. There's nothing server-side to delete, and
   // queuing a pending delete for a row that never existed there would just
   // sit in that queue forever (harmless, but pointless) while also leaving
-  // the now-orphaned pending create free to resurrect this note on the next
-  // sync's reconcileWithCloud() merge (the actual ghost-note bug this
-  // guards against).
+  // the now-orphaned pending create free to have flushPendingCreates() push
+  // this note right back to Supabase on the next sync, undoing the delete.
   const wasPendingCreate = getPendingCreates().some(p => p.id === id && p.type === 'note');
   removePendingCreate(id);
 
