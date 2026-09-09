@@ -1004,6 +1004,112 @@
     .empty-state p { font-size: 14px; }
     .empty-state strong { color: var(--text); display: block; font-size: 18px; font-weight: 500; text-align: center; margin-bottom: 4px; }
 
+    /* ── Folder grid (main-area overview, distinct from the sidebar folder list) ── */
+    .folder-grid-view {
+      flex: 1;
+      overflow-y: auto;
+      padding: 32px;
+    }
+    .folder-grid-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 24px;
+      max-width: 1100px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    .folder-grid-header h2 {
+      font-size: 20px;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .folder-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+      gap: 16px;
+      max-width: 1100px;
+      margin: 0 auto;
+    }
+    .folder-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 20px 16px;
+      cursor: pointer;
+      transition: border-color 0.15s, transform 0.15s, background 0.15s;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      position: relative;
+      min-height: 120px;
+    }
+    .folder-card:hover {
+      border-color: var(--accent);
+      background: var(--surface2);
+      transform: translateY(-2px);
+    }
+    .folder-card-icon {
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .folder-card-icon svg { width: 20px; height: 20px; }
+    .folder-card-name {
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .folder-card-meta {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-top: auto;
+    }
+    .folder-card-actions {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      display: flex;
+      gap: 2px;
+      opacity: 0;
+      transition: opacity 0.15s;
+    }
+    .folder-card:hover .folder-card-actions { opacity: 1; }
+    .folder-card-actions button {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      width: 26px;
+      height: 26px;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: color 0.15s, background 0.15s;
+    }
+    .folder-card-actions button:hover {
+      color: var(--text);
+      background: var(--border);
+    }
+    /* "All Notes" special card — always first in the grid */
+    .folder-card.all-notes-card {
+      background: var(--accent-soft);
+      border-color: var(--accent)44;
+    }
+    .folder-card.all-notes-card .folder-card-icon {
+      background: var(--accent);
+      color: white;
+    }
+
     /* ── Mobile sidebar toggle ── */
     .mobile-bar {
       display: none;
@@ -1079,6 +1185,14 @@
       .color-swatch[data-color="#2DB85B"],
       .color-swatch[data-color="#9B2DE3"] { display: none; }
       .empty-state { padding: 0 24px; text-align: center; }
+
+      .folder-grid-view { padding: 16px; }
+      .folder-grid {
+        grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+        gap: 10px;
+      }
+      .folder-card { padding: 14px 12px; min-height: 100px; }
+      .folder-card-actions { opacity: 0.6; } /* no hover on touch */
     }
 
     /* fade-in on note switch */
@@ -1397,6 +1511,16 @@
       <div class="text-area-wrap" id="typeWrap">
         <textarea class="note-textarea" id="noteTextarea" placeholder="Start typing your note here…"></textarea>
       </div>
+    </div>
+
+    <!-- Visual overview of all folders — an alternative to the flat sidebar
+         list, not a replacement for it. See showFolderGrid()/switchToNotesView(). -->
+    <div class="folder-grid-view" id="folderGridView" style="display:none">
+      <div class="folder-grid-header">
+        <h2>All Folders</h2>
+        <button class="btn-new" onclick="createFolder()">+ New Folder</button>
+      </div>
+      <div class="folder-grid" id="folderGrid"></div>
     </div>
   </div>
 </div>
@@ -2066,6 +2190,7 @@ let notes = safeGetLocal('inkpad_notes', []);
 let activeId = null;
 let folders = safeGetLocal('welovenote_folders', []);
 let activeFolderId = null; // null = "All Notes" view
+let mainView = 'notes'; // 'notes' | 'folderGrid' — which content fills .main
 let mode = 'type'; // 'ink' | 'type'
 let drawing = false;
 let lastX = 0, lastY = 0;
@@ -2727,6 +2852,16 @@ function setSaveStatus(txt) {
 // ── Select Note ──
 function selectNote(id) {
   isSwitchingNote = true;
+
+  // The sidebar's notes list stays visible (and clickable) even while the
+  // folder grid is showing in .main — clicking a note there is what's
+  // replacing the grid, not switchToNotesView() (which itself calls this
+  // function, so THAT path already has mainView reset before getting here).
+  if (mainView === 'folderGrid') {
+    mainView = 'notes';
+    document.getElementById('folderGridView').style.display = 'none';
+    renderFolders(); // refresh sidebar highlighting now that the grid isn't active
+  }
 
   // Save previous
   // immediate=true: the canvas gets cleared/reused for the incoming note a
@@ -3397,9 +3532,17 @@ const FOLDER_ICON_CLOSED = `<svg viewBox="0 0 24 24" fill="none" stroke="current
 const FOLDER_ICON_OPEN = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="15" height="15"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><polyline points="2 10 12 10 22 10"/></svg>`;
 const FOLDER_ICON_NEW = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="12" y1="13" x2="12" y2="17"/><line x1="10" y1="15" x2="14" y2="15"/></svg>`;
 
+// The grid-view icon (4 squares) doubles as the "All Folders" row's icon in
+// the sidebar and the header/nothing-to-show-yet cases in the grid itself.
+const FOLDER_ICON_GRID = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="15" height="15"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>`;
+
 function renderFolders() {
   const list = document.getElementById('foldersList');
-  const allActive = activeFolderId === null;
+  const gridActive = mainView === 'folderGrid';
+  // Only one row (All Notes / All Folders / a specific folder) is ever
+  // highlighted at once — grid view showing takes priority over whatever
+  // activeFolderId happens to still be set to underneath it.
+  const allActive = activeFolderId === null && !gridActive;
 
   const allNotesRow = `
     <div class="folder-item${allActive ? ' active' : ''}" id="folderAll" onclick="selectFolder(null)">
@@ -3408,8 +3551,15 @@ function renderFolders() {
       <span class="folder-count">${notes.length}</span>
     </div>`;
 
+  const allFoldersRow = `
+    <div class="folder-item${gridActive ? ' active' : ''}" id="folderAllView" onclick="showFolderGrid()">
+      ${FOLDER_ICON_GRID}
+      <span>All Folders</span>
+      <span class="folder-count" id="allFoldersCount">${folders.length}</span>
+    </div>`;
+
   const folderRows = folders.map(f => {
-    const isActive = activeFolderId === f.id;
+    const isActive = activeFolderId === f.id && !gridActive;
     const count = notes.filter(n => n.folderId === f.id).length;
     return `
     <div class="folder-item${isActive ? ' active' : ''}" data-folder-id="${f.id}" onclick="selectFolder('${f.id}')">
@@ -3438,7 +3588,106 @@ function renderFolders() {
       <span>New Folder</span>
     </button>`;
 
-  list.innerHTML = allNotesRow + folderRows + newFolderBtn;
+  list.innerHTML = allNotesRow + allFoldersRow + folderRows + newFolderBtn;
+
+  // Keep the grid's counts/cards live if a note gets added/removed/moved
+  // (or a folder renamed/deleted) while the grid happens to be open.
+  if (mainView === 'folderGrid') renderFolderGrid();
+}
+
+// ── Folder grid (main-area overview) ──
+function renderFolderGrid() {
+  const grid = document.getElementById('folderGrid');
+  const totalNotes = notes.length;
+
+  const allNotesCard = `
+    <div class="folder-card all-notes-card" onclick="selectFolder(null)">
+      <div class="folder-card-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+          <polyline points="14 2 14 8 20 8"/>
+        </svg>
+      </div>
+      <div class="folder-card-name">All Notes</div>
+      <div class="folder-card-meta">${totalNotes} note${totalNotes !== 1 ? 's' : ''}</div>
+    </div>`;
+
+  if (folders.length === 0) {
+    grid.innerHTML = allNotesCard + `
+      <div style="grid-column: 1/-1; text-align:center; padding:40px 20px; color:var(--text-muted); font-size:13px;">
+        No folders yet. Create one to start organizing your notes.
+      </div>`;
+    return;
+  }
+
+  const folderCards = folders.map(f => {
+    const count = notes.filter(n => n.folderId === f.id).length;
+    return `
+    <div class="folder-card" data-folder-id="${f.id}" onclick="selectFolder('${f.id}')">
+      <div class="folder-card-actions">
+        <button onclick="event.stopPropagation(); startRenameFolderFromGrid('${f.id}')" title="Rename">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="12" height="12">
+            <path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/>
+          </svg>
+        </button>
+        <button onclick="event.stopPropagation(); deleteFolder('${f.id}', event)" title="Delete">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="12" height="12">
+            <polyline points="3 6 5 6 21 6"/>
+            <path d="M19 6l-1 14H6L5 6"/>
+          </svg>
+        </button>
+      </div>
+      <div class="folder-card-icon">${FOLDER_ICON_CLOSED}</div>
+      <div class="folder-card-name">${escapeHtml(f.name)}</div>
+      <div class="folder-card-meta">${count} note${count !== 1 ? 's' : ''}</div>
+    </div>`;
+  }).join('');
+
+  grid.innerHTML = allNotesCard + folderCards;
+}
+
+// Shows the folder grid in place of whatever the main content area was
+// showing (a note, or the empty state). Sidebar stays exactly as it was —
+// this only replaces .main's content, same as selectNote()/showEmpty() do.
+function showFolderGrid() {
+  if (activeId) saveActiveNote(true); // don't lose unsaved edits to whatever note was open
+  mainView = 'folderGrid';
+  activeId = null;
+
+  document.getElementById('emptyState').style.display = 'none';
+  document.getElementById('toolbar').style.display = 'none';
+  document.getElementById('noteSurface').style.display = 'none';
+  document.getElementById('folderGridView').style.display = 'flex';
+
+  renderFolderGrid();
+  renderFolders(); // refresh sidebar highlighting — "All Folders" is now the active row
+  closeSidebar(); // close the mobile drawer, same as selectNote() does
+}
+
+// Leaves the grid and restores whichever note (or the empty state) belongs
+// in the currently active folder filter. Called both directly (e.g. from
+// selectFolder() below) and via the grid's own note-selecting cards.
+function switchToNotesView() {
+  if (mainView !== 'folderGrid') return; // already there — nothing to undo
+  mainView = 'notes';
+  document.getElementById('folderGridView').style.display = 'none';
+  renderFolders(); // refresh sidebar highlighting now that the grid isn't active
+
+  if (notes.length > 0) {
+    const filtered = activeFolderId === null ? notes : notes.filter(n => n.folderId === activeFolderId);
+    if (filtered.length > 0) selectNote(filtered[0].id);
+    else showEmpty();
+  } else {
+    showEmpty();
+  }
+}
+
+function startRenameFolderFromGrid(folderId) {
+  // startRenameFolder() looks for .folder-item[data-folder-id] .folder-name,
+  // which only exists in the sidebar's own folder list — switch there first
+  // (selectFolder() exits the grid automatically) so it has something to find.
+  selectFolder(folderId);
+  setTimeout(() => startRenameFolder(folderId), 100);
 }
 
 function createFolder() {
@@ -3537,6 +3786,11 @@ async function deleteFolder(id, e) {
 
 function selectFolder(folderId) {
   activeFolderId = folderId;
+  // Exiting the grid this way already restores a note (or the empty state)
+  // and re-renders the sidebar itself — covers every path that calls this
+  // (sidebar rows, the grid's own cards) uniformly, so none of them need
+  // their own explicit "leave the grid" handling.
+  if (mainView === 'folderGrid') switchToNotesView();
   renderFolders();
   renderList();
 }
@@ -3703,6 +3957,15 @@ function formatDate(ts) {
 }
 
 function showEmpty() {
+  // Defensive, same reasoning as selectNote() above — showEmpty() isn't
+  // currently reachable while mainView is 'folderGrid' (every path that
+  // calls it first checks activeId, which showFolderGrid() always nulls),
+  // but it shouldn't leave the grid showing underneath it if that ever changes.
+  if (mainView === 'folderGrid') {
+    mainView = 'notes';
+    document.getElementById('folderGridView').style.display = 'none';
+    renderFolders();
+  }
   document.getElementById('toolbar').style.display = 'none';
   document.getElementById('noteSurface').style.display = 'none';
   document.getElementById('emptyState').style.display = 'flex';
