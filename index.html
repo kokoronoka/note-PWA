@@ -48,11 +48,20 @@
       font-family: var(--font-ui);
       overflow: hidden;
     }
+    /* Column so #guestBanner (normal flow, natural height) can sit above
+       #app without either of them needing a fixed/measured pixel height —
+       #app just fills whatever's left. #authScreen/#loadingOverlay are both
+       position:fixed so they're unaffected by this either way. */
+    body {
+      display: flex;
+      flex-direction: column;
+    }
 
     /* ── Layout ── */
     .app {
       display: flex;
-      height: 100vh;
+      flex: 1;
+      min-height: 0; /* let it shrink below content size instead of overflowing when the banner is showing */
       overflow: hidden;
       /* Keep content clear of notches / Dynamic Island / home indicator */
       padding-top: env(safe-area-inset-top);
@@ -655,6 +664,39 @@
     #syncDot.connected { background: #2DB85B; } /* green = live */
     #syncDot.error { background: var(--danger); } /* red = disconnected */
     #syncDot.syncing { background: var(--accent); animation: pulse 0.8s ease-in-out infinite; }
+    #syncDot.local-only { background: var(--text-muted); opacity: 0.5; } /* guest mode — nothing to sync */
+
+    /* ── Guest mode banner ── */
+    .guest-banner {
+      display: none;
+      background: var(--accent-soft);
+      border-bottom: 1px solid var(--accent);
+      color: var(--text);
+      padding: 8px 16px;
+      font-size: 12px;
+      align-items: center;
+      gap: 10px;
+      justify-content: center;
+      flex-wrap: wrap;
+      flex-shrink: 0; /* stay full height in the body flex column, never get squeezed by #app */
+    }
+    .guest-banner.visible { display: flex; }
+    .guest-banner button {
+      background: var(--accent);
+      color: white;
+      border: none;
+      border-radius: 6px;
+      padding: 4px 10px;
+      font-size: 11px;
+      font-family: var(--font-ui);
+      cursor: pointer;
+    }
+    #btnDismissBanner {
+      background: none;
+      color: var(--text-muted);
+      font-size: 16px;
+      padding: 0 4px;
+    }
     @keyframes pulse {
       0%, 100% { opacity: 1; transform: scale(1); }
       50% { opacity: 0.4; transform: scale(0.8); }
@@ -1079,6 +1121,10 @@
       </svg>
       Continue with Google
     </button>
+
+    <button id="btnContinueGuest" style="background:none;border:none;color:var(--text-muted);font-family:var(--font-ui);font-size:12px;cursor:pointer;text-decoration:underline;margin-top:14px;align-self:center;padding:4px;">
+      Continue without an account
+    </button>
   </div>
 </div>
 
@@ -1086,6 +1132,14 @@
 <div class="loading-overlay" id="loadingOverlay">
   <div class="loading-spinner"></div>
   <p class="loading-text" id="loadingText">Loading your notes…</p>
+</div>
+
+<!-- Shown whenever the app is open without a signed-in session (guest mode
+     or a session that was signed out from under this tab) -->
+<div class="guest-banner" id="guestBanner">
+  <span>You're using Welovenote without an account — notes are saved on this device only.</span>
+  <button id="btnGuestSignIn">Sign in to sync</button>
+  <button id="btnDismissBanner" title="Dismiss">×</button>
 </div>
 
 <div class="app" id="app" style="display:none">
@@ -3862,9 +3916,14 @@ document.addEventListener('keydown', e => {
 });
 
 // ── Auth ──
-// Gates the app behind Supabase sign-in. Notes themselves stay entirely in
-// localStorage for now (no sync) — this only controls whether the app UI
-// is shown at all.
+// Signing in is optional, not a gate — "Continue without an account" (below)
+// boots the app the same way a real sign-in does, just with currentUser left
+// null. Every cloud function already no-ops/falls back to localStorage when
+// there's no valid session (see getValidUser and friends), so guest mode
+// needs no special-casing anywhere else — the only thing this section adds
+// on top of that is telling the user they're in it (see updateGuestBanner/
+// updateSyncDot) and offering to migrate local notes if they sign in later
+// (see handlePostLoginMigration).
 let appInitialized = false;
 
 function showAuthScreen() {
@@ -3888,13 +3947,91 @@ async function bootApp() {
     // users just have .email — email wins when both happen to be present.
     document.getElementById('userEmail').textContent =
       currentUser.email || currentUser.user_metadata?.full_name || 'Signed in';
+  } else {
+    document.getElementById('userEmail').textContent = '';
   }
   document.getElementById('btnRefresh').style.display = currentUser ? 'flex' : 'none';
+  updateGuestBanner();
+  updateSyncDot();
   if (!appInitialized) {
     appInitialized = true;
     await initApp();
   }
   document.getElementById('app').style.display = 'flex';
+}
+
+// ── Guest mode visibility ──
+function updateGuestBanner() {
+  const banner = document.getElementById('guestBanner');
+  const dismissed = sessionStorage.getItem('guestBannerDismissed');
+  if (!currentUser && !dismissed) {
+    banner.classList.add('visible');
+  } else {
+    banner.classList.remove('visible');
+  }
+}
+
+document.getElementById('btnDismissBanner').addEventListener('click', () => {
+  sessionStorage.setItem('guestBannerDismissed', '1');
+  updateGuestBanner();
+});
+
+document.getElementById('btnGuestSignIn').addEventListener('click', () => {
+  showAuthScreen();
+});
+
+// Only touches the dot when there's no user — subscribeToRealtime()/syncNow()
+// already own 'connected'/'syncing'/'error' for the signed-in case, and both
+// already no-op when currentUser is null, so there's nothing for this to
+// step on either way.
+function updateSyncDot() {
+  const dot = document.getElementById('syncDot');
+  if (!dot) return;
+  if (!currentUser) {
+    dot.className = 'local-only';
+    dot.title = 'Local only — sign in to sync';
+  }
+}
+
+// "Continue without an account" — boots the app exactly like a real sign-in
+// does (bootApp() already handles currentUser being null correctly), just
+// without ever prompting for credentials.
+document.getElementById('btnContinueGuest').addEventListener('click', () => {
+  bootApp();
+});
+
+// Offers to upload this device's local-only notes/folders the first time a
+// guest signs into a real account, so they don't end up stranded on this
+// device. Must run — and, if accepted, finish — before initApp()'s cloud
+// fetch, or that fetch would show an empty list while the upload is still
+// in flight. Guarded so a duplicate SIGNED_IN event (bootApp's own comment
+// notes these happen) can't pop the confirm() dialog twice for one login.
+let migrationOfferedThisSession = false;
+
+async function handlePostLoginMigration() {
+  if (migrationOfferedThisSession) return;
+  migrationOfferedThisSession = true;
+
+  const localNotes = safeGetLocal('inkpad_notes', []);
+  const localFolders = safeGetLocal('welovenote_folders', []);
+
+  if (localNotes.length === 0 && localFolders.length === 0) return;
+
+  const confirmed = confirm(
+    `You have ${localNotes.length} note(s) saved on this device. Upload them to your account now?`
+  );
+  if (!confirmed) return;
+
+  showToast('Uploading your local notes…', 3000);
+
+  for (const folder of localFolders) {
+    await upsertFolderToCloud(folder);
+  }
+  for (const note of localNotes) {
+    await upsertNoteToCloud(note);
+  }
+
+  showToast('Done! Your notes are now synced.', 3000);
 }
 
 function setAuthError(msg) {
@@ -3959,7 +4096,14 @@ async function handleSignUp() {
     if (error) { setAuthError(mapAuthError(error)); return; }
     if (data && data.session) {
       // Email confirmation is off for this project — signUp already
-      // returned a live session, so log the user straight in
+      // returned a live session, so log the user straight in. This is also
+      // the most likely real "guest creates an account" path — a bare
+      // bootApp() here could otherwise race ahead of onAuthStateChange's own
+      // SIGNED_IN handler (which also calls this), running initApp()'s
+      // cloud fetch before a just-accepted migration finishes; awaiting it
+      // here directly closes that gap (harmless if the other one also
+      // fires — migrationOfferedThisSession guards against asking twice).
+      await handlePostLoginMigration();
       bootApp();
     } else if (data && data.user) {
       setAuthMessage('Check your email to confirm your account.');
@@ -4059,7 +4203,7 @@ async function handleSignOut() {
 
 document.getElementById('btnSignOut').addEventListener('click', handleSignOut);
 
-supabaseClient.auth.onAuthStateChange((event, session) => {
+supabaseClient.auth.onAuthStateChange(async (event, session) => {
   // Kept in sync on every auth event (including the INITIAL_SESSION one
   // fired as soon as this listener is registered) — see currentUser's own
   // comment above for why this replaced calling getUser() fresh on every
@@ -4088,10 +4232,17 @@ supabaseClient.auth.onAuthStateChange((event, session) => {
     activeId = null;
     activeFolderId = null;
     appInitialized = false;
+    migrationOfferedThisSession = false; // a fresh login after this gets its own migration offer
     document.getElementById('authEmail').value = '';
     document.getElementById('authPassword').value = '';
+    updateGuestBanner();
+    updateSyncDot();
     showAuthScreen();
   } else if (event === 'SIGNED_IN') {
+    // Must finish before bootApp() -> initApp() fetches the cloud, or that
+    // fetch would show an empty list while a just-accepted upload is still
+    // in flight (see handlePostLoginMigration's own comment).
+    await handlePostLoginMigration();
     bootApp();
   }
 });
