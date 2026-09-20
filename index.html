@@ -2031,6 +2031,11 @@ async function deleteNoteFromCloud(noteId) {
 }
 
 function mapCloudNoteToLocal(cloudNote) {
+  // Carry over the device-local parts of the note. pageIndex is view state
+  // that never goes to the cloud, and doc falls back to what this device
+  // already knows if the row predates the doc_meta column or its write
+  // hasn't landed yet — without it, a sync drops the attachment entirely.
+  const local = notes.find(n => n.id === cloudNote.id);
   return {
     id: cloudNote.id,
     title: cloudNote.title,
@@ -2041,8 +2046,8 @@ function mapCloudNoteToLocal(cloudNote) {
     panX: cloudNote.pan_x,
     panY: cloudNote.pan_y,
     folderId: cloudNote.folder_id || null,
-    doc: cloudNote.doc_meta || null,
-    pageIndex: 0,
+    doc: cloudNote.doc_meta || local?.doc || null,
+    pageIndex: local?.pageIndex || 0,
     created: new Date(cloudNote.created_at).getTime(),
     updated: new Date(cloudNote.updated_at).getTime()
   };
@@ -2891,6 +2896,11 @@ function reloadActiveNoteContent(note) {
     document.getElementById('noteTitleInput').value = note.title || '';
   }
 
+  // An imported note's ink lives per page in IndexedDB, and note.inkData is
+  // whatever the note held before the import. Repainting it here would drop
+  // pre-import strokes on top of the document and clobber the real page ink.
+  if (note.doc) return;
+
   if (note.type === 'ink' && note.inkData) {
     const img = new Image();
     img.onload = () => {
@@ -3134,6 +3144,9 @@ function selectNote(id) {
   // differs from the default, so it takes a separate path from note.inkData.
   // renderNotePage() also restores the default page for ordinary notes, which
   // is what undoes a previous doc note's resize.
+  // Resume on the page this note was left on, and set it BEFORE rendering —
+  // everything below keys off currentDocPage, not the note object.
+  currentDocPage = (note.doc && note.pageIndex) || 0;
   const pageGen = ++pageRenderToken; // this navigation owns the canvas from here
   renderNotePage(note, pageGen).then(() => {
     if (note.doc && pageGen === pageRenderToken) return loadPageInk(note, pageGen);
@@ -3311,7 +3324,16 @@ function docPageDims(aspect) {
   return { w, h, dpr: 1.5 };
 }
 
-function inkKey(note, page) { return `${note.id}:${page ?? note.pageIndex ?? 0}`; }
+// Which page of the imported document is on the canvas right now. This is
+// rendering state, NOT note data, and it is deliberately not read back off
+// the note object: a cloud sync replaces that object wholesale, and the
+// replacement's pageIndex reset the view to page 1 while the canvas still
+// showed page 6 — the next flip then saved page 6's ink under page 1's key
+// and jumped to page 2. note.pageIndex is still written, purely so reopening
+// a note returns to the page you left.
+let currentDocPage = 0;
+
+function inkKey(note, page) { return `${note.id}:${page ?? currentDocPage}`; }
 
 // PNG, not the JPEG ordinary notes use: the ink layer has to stay transparent
 // so the document shows through underneath it.
@@ -3415,7 +3437,7 @@ async function renderNotePage(note, token = pageRenderToken) {
   try {
     if (note.doc.kind === 'pdf') {
       const pdf = await getPdfFor(note.doc.fileId, blob);
-      const page = await pdf.getPage((note.pageIndex || 0) + 1);
+      const page = await pdf.getPage(currentDocPage + 1);
       // Parsing/rendering is slow enough that the user can flip pages or
       // switch notes mid-flight; painting then would put this page under
       // another page's ink
@@ -3471,7 +3493,7 @@ async function renderNotePage(note, token = pageRenderToken) {
 function updatePageBar(note) {
   const bar = document.getElementById('pageBar');
   if (!note || !note.doc || note.doc.pageCount <= 1) { bar.style.display = 'none'; return; }
-  const page = note.pageIndex || 0;
+  const page = currentDocPage;
   bar.style.display = 'flex';
   document.getElementById('pageLabel').textContent = `${page + 1} / ${note.doc.pageCount}`;
   document.getElementById('pagePrev').disabled = page === 0;
@@ -3495,7 +3517,7 @@ async function goToPage(index) {
   const target = Math.max(0, Math.min(note.doc.pageCount - 1, index));
 
   if (pageSwitchBusy) { queuedPage = target; return; }
-  if (target === (note.pageIndex || 0)) return;
+  if (target === currentDocPage) return;
 
   pageSwitchBusy = true;
   inFlightTarget = target;
@@ -3504,7 +3526,8 @@ async function goToPage(index) {
     // why a pending debounced save is dangerous across a page flip.
     clearTimeout(saveTimer);
     await savePageInk(note); // keep whatever was drawn on the page being left
-    note.pageIndex = target;
+    currentDocPage = target;
+    note.pageIndex = target; // persisted only so reopening resumes on this page
     note.updated = Date.now();
     saveNotes();
     const pageGen = ++pageRenderToken;
@@ -3607,7 +3630,7 @@ function pageStep(delta) {
   if (!note || !note.doc) return;
   const from = queuedPage !== null ? queuedPage
     : inFlightTarget !== null ? inFlightTarget
-    : (note.pageIndex || 0);
+    : currentDocPage;
   goToPage(from + delta);
 }
 // iOS reclaims canvas backing stores while the app is backgrounded, which is
