@@ -3261,6 +3261,7 @@ function loadPdfJs() {
 // Parsing a PDF is slow enough that re-doing it on every page flip is visible,
 // so the open document is kept until a different file is opened.
 let pdfCache = { fileId: null, pdf: null };
+let activeRenderTask = null; // in-flight pdf.js render, cancelled on a fast flip
 async function getPdfFor(fileId, blob) {
   if (pdfCache.fileId === fileId && pdfCache.pdf) return pdfCache.pdf;
   const lib = await loadPdfJs();
@@ -3276,9 +3277,16 @@ async function getPdfFor(fileId, blob) {
 function docPageDims(aspect) {
   const base = getCanvasDims();
   const budget = Math.max(base.w, base.h);
-  return aspect >= 1
+  const dims = aspect >= 1
     ? { w: budget, h: Math.round(budget / aspect) }
     : { w: Math.round(budget * aspect), h: budget };
+  // Three canvases (page, ink, stroke buffer) are all allocated at this size
+  // times DPR squared. At DPR 2 that was ~73MB on a phone, which is where
+  // iOS starts silently discarding canvas backing stores — the page and the
+  // strokes both just turn blank. 1.5 keeps a PDF crisp at fit-to-width
+  // while cutting that by about half.
+  dims.dpr = 1.5;
+  return dims;
 }
 
 function inkKey(note, page) { return `${note.id}:${page ?? note.pageIndex ?? 0}`; }
@@ -3287,8 +3295,14 @@ function inkKey(note, page) { return `${note.id}:${page ?? note.pageIndex ?? 0}`
 // so the document shows through underneath it.
 async function savePageInk(note) {
   if (!note || !note.doc) return;
-  try { await idbPut(STORE_INK, inkKey(note), canvas.toDataURL('image/png')); }
-  catch (err) { console.error('Could not save page ink:', err); }
+  const key = inkKey(note); // resolved now: note.pageIndex may move while encoding
+  try {
+    // toBlob instead of toDataURL: the encode runs off the main thread and
+    // skips base64, which is a third of the bytes and was a visible freeze on
+    // a multi-megapixel page. IndexedDB stores the Blob as-is.
+    const blob = await new Promise(res => canvas.toBlob(res, 'image/png'));
+    if (blob) await idbPut(STORE_INK, key, blob);
+  } catch (err) { console.error('Could not save page ink:', err); }
 }
 
 // One generation per navigation — a note switch or a page flip bumps it, and
@@ -3305,16 +3319,27 @@ async function loadPageInk(note, token = pageRenderToken) {
   try { url = await idbGet(STORE_INK, inkKey(note)); } catch (err) { console.error('Could not read page ink:', err); }
   if (token !== pageRenderToken) return;
   if (url) {
-    await new Promise(res => {
-      const img = new Image();
-      img.onload = () => {
-        if (token === pageRenderToken) ctx.drawImage(img, 0, 0, CANVAS_W, CANVAS_H);
-        res();
-      };
-      img.onerror = res;
-      img.src = url;
-    });
-    if (token !== pageRenderToken) return;
+    // Blob since the switch away from data URLs; strings are pages saved by
+    // an earlier version and still readable.
+    if (url instanceof Blob) {
+      try {
+        const bmp = await createImageBitmap(url);
+        if (token === pageRenderToken) ctx.drawImage(bmp, 0, 0, CANVAS_W, CANVAS_H);
+        bmp.close?.();
+      } catch (err) { console.error('Could not decode page ink:', err); }
+      if (token !== pageRenderToken) return;
+    } else {
+      await new Promise(res => {
+        const img = new Image();
+        img.onload = () => {
+          if (token === pageRenderToken) ctx.drawImage(img, 0, 0, CANVAS_W, CANVAS_H);
+          res();
+        };
+        img.onerror = res;
+        img.src = url;
+      });
+      if (token !== pageRenderToken) return;
+    }
   }
   undoStack = [];
   saveSnapshot();
@@ -3354,12 +3379,25 @@ async function renderNotePage(note, token = pageRenderToken) {
       // another page's ink
       if (activeId !== note.id || token !== pageRenderToken) return;
       const natural = page.getViewport({ scale: 1 });
+      // pdf.js refuses two concurrent render() calls on one canvas and leaves
+      // it blank if it happens, so any still-running render is cancelled first.
+      if (activeRenderTask) { try { activeRenderTask.cancel(); } catch (err) {} }
       // pageBgCtx is already scale(DPR,DPR)'d, so render at logical size and
       // the device pixels come out right without double-scaling.
-      await page.render({
+      activeRenderTask = page.render({
         canvasContext: pageBgCtx,
         viewport: page.getViewport({ scale: CANVAS_W / natural.width }),
-      }).promise;
+      });
+      try {
+        await activeRenderTask.promise;
+      } catch (err) {
+        // A cancelled render is the expected outcome of flipping fast, not a
+        // failure worth showing the user
+        if (err && err.name === 'RenderingCancelledException') return;
+        throw err;
+      } finally {
+        activeRenderTask = null;
+      }
     } else {
       const bmp = await createImageBitmap(blob);
       if (activeId !== note.id || token !== pageRenderToken) { bmp.close?.(); return; }
@@ -3383,14 +3421,27 @@ function updatePageBar(note) {
   document.getElementById('pageNext').disabled = page >= note.doc.pageCount - 1;
 }
 
+// A flip involves a PDF render and two IndexedDB round trips, so taps land
+// while one is still running. Dropping those (the obvious guard) loses them:
+// tapping Next three times quickly would advance a single page. Instead the
+// newest request is remembered and run when the current one finishes.
 let pageSwitchBusy = false;
+let queuedPage = null;
+// The page a running flip is heading for. note.pageIndex only moves after the
+// first await, so without this two taps in the same tick both read the old
+// page and ask for the same target.
+let inFlightTarget = null;
+
 async function goToPage(index) {
   const note = getActive();
-  if (!note || !note.doc || pageSwitchBusy) return;
+  if (!note || !note.doc) return;
   const target = Math.max(0, Math.min(note.doc.pageCount - 1, index));
+
+  if (pageSwitchBusy) { queuedPage = target; return; }
   if (target === (note.pageIndex || 0)) return;
 
   pageSwitchBusy = true;
+  inFlightTarget = target;
   try {
     // Must happen before pageIndex moves — see saveActiveNote's own note on
     // why a pending debounced save is dangerous across a page flip.
@@ -3404,6 +3455,13 @@ async function goToPage(index) {
     await loadPageInk(note, pageGen);    // must follow: the resize clears the ink canvas
   } finally {
     pageSwitchBusy = false;
+    inFlightTarget = null;
+  }
+
+  if (queuedPage !== null) {
+    const next = queuedPage;
+    queuedPage = null;
+    await goToPage(next);
   }
 }
 
@@ -3485,8 +3543,29 @@ document.getElementById('btnImportFile').addEventListener('click', () => {
   openFilePicker('new');
 });
 document.getElementById('btnImportIntoNote').addEventListener('click', () => openFilePicker('current'));
-document.getElementById('pagePrev').addEventListener('click', () => goToPage((getActive()?.pageIndex || 0) - 1));
-document.getElementById('pageNext').addEventListener('click', () => goToPage((getActive()?.pageIndex || 0) + 1));
+// Steps from the page already queued, not the one on screen — otherwise three
+// quick taps on Next all compute "current + 1" and collapse into one page.
+function pageStep(delta) {
+  const note = getActive();
+  if (!note || !note.doc) return;
+  const from = queuedPage !== null ? queuedPage
+    : inFlightTarget !== null ? inFlightTarget
+    : (note.pageIndex || 0);
+  goToPage(from + delta);
+}
+// iOS reclaims canvas backing stores while the app is backgrounded, which is
+// what turns an imported page blank after switching apps. Repainting the
+// background on return fixes it. Deliberately does not touch the ink canvas:
+// if that was evicted too, re-saving a blank canvas would destroy the real
+// strokes still held in IndexedDB.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  const note = getActive();
+  if (note && note.doc) renderNotePage(note, ++pageRenderToken);
+});
+
+document.getElementById('pagePrev').addEventListener('click', () => pageStep(-1));
+document.getElementById('pageNext').addEventListener('click', () => pageStep(1));
 
 // The canvas is a fixed-size logical page (CANVAS_W x CANVAS_H), sized once.
 // Zoom/pan never touch these dimensions — they only move the CSS transform.
@@ -3497,7 +3576,9 @@ function initCanvasSize(override) {
   const dims = override || getCanvasDims();
   CANVAS_W = dims.w;
   CANVAS_H = dims.h;
-  DPR = Math.min(window.devicePixelRatio || 1, 2); // cap regardless of actual screen density
+  // Cap regardless of actual screen density; imported pages ask for a lower
+  // cap still, since they allocate a third full-size canvas (see docPageDims)
+  DPR = Math.min(window.devicePixelRatio || 1, dims.dpr || 2);
 
   [canvas, bufferCanvas, pageBg].forEach(c => {
     c.style.width = CANVAS_W + 'px';
