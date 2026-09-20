@@ -1146,6 +1146,11 @@
     }
 
     /* ── Mobile sidebar toggle ── */
+    /* Only ever shown on phones with a note open — see body.note-open below.
+       Scoped via .toolbar so it outranks .btn-menu's own display:flex, which
+       is declared after this and would otherwise win on source order. */
+    .toolbar .btn-menu-toolbar { display: none; }
+
     .mobile-bar {
       display: none;
       background: var(--surface);
@@ -1175,18 +1180,40 @@
         top: 0; left: 0; bottom: 0;
         transform: translateX(-100%);
         box-shadow: 4px 0 30px #00000066;
+        /* position:fixed takes the drawer out of .app's box, so it does NOT
+           inherit the safe-area padding set there — without these the header
+           ("+ New") sits under the status bar / notch, where tapping it can
+           pull down the system shade instead. */
+        padding-top: env(safe-area-inset-top);
+        padding-bottom: env(safe-area-inset-bottom);
       }
       .sidebar.open { transform: translateX(0); }
       .sidebar-overlay.open { display: block; }
-      .mobile-bar { display: flex; }
+      .mobile-bar { display: flex; padding: 6px 12px; }
       .text-area-wrap { padding: 12px; }
-      .toolbar { padding: 8px 12px; gap: 8px; }
       .toolbar-divider { display: none; }
 
-      /* Stack the toolbar: row 1 = title + mode toggle (default DOM order),
-         row 2 = ink tools, forced onto its own line via flex-basis:100% */
-      .note-title-input { min-width: 80px; }
-      .ink-tools { flex-basis: 100%; }
+      /* With a note open the brand bar is redundant — drop it and move its
+         menu button into the toolbar, so the note gets that whole row back. */
+      body.note-open .mobile-bar { display: none; }
+      body.note-open .toolbar .btn-menu-toolbar { display: flex; }
+
+      /* One scrolling row instead of wrapping onto a second (and in ink mode,
+         a third) — the same pattern Apple Notes uses for its format bar. The
+         alternative, stacking rows, is what ate the note's vertical space. */
+      .toolbar {
+        padding: 5px 10px;
+        gap: 8px;
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        overflow-y: hidden;
+        scrollbar-width: none;
+      }
+      .toolbar::-webkit-scrollbar { display: none; }
+      .toolbar > * { flex-shrink: 0; }
+      /* The one element allowed to give up space as the row fills */
+      .note-title-input { min-width: 80px; flex-shrink: 1; }
+      .ink-tools { flex-basis: auto; }
 
       /* Comfortable touch targets */
       .btn-new, .btn-icon, .btn-menu { min-width: 44px; min-height: 44px; }
@@ -1213,7 +1240,9 @@
       .sidebar { width: 100vw; min-width: 100vw; }
       /* No :hover on touch — keep the menu button visibly tappable instead */
       .note-menu-btn { opacity: 0.5; }
-      .note-textarea { padding: 20px 16px; }
+      /* Give the writing surface the reclaimed space instead of framing it */
+      .text-area-wrap { padding: 6px; }
+      .note-textarea { padding: 16px 14px; }
       .save-status { display: none; }
       .stroke-size input[type=range] { width: 60px; }
       /* Fewer swatches to save space — black, blue, red + custom picker */
@@ -1403,6 +1432,15 @@
 
     <!-- Toolbar (hidden when no note) -->
     <div class="toolbar" id="toolbar" style="display:none">
+      <!-- Phone-only: with a note open the mobile bar is hidden to give the
+           note more room, so the drawer needs a way in from the toolbar -->
+      <button class="btn-menu btn-menu-toolbar" id="btnMenuToolbar" title="Menu">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+          <line x1="3" y1="6" x2="21" y2="6"/>
+          <line x1="3" y1="12" x2="21" y2="12"/>
+          <line x1="3" y1="18" x2="21" y2="18"/>
+        </svg>
+      </button>
       <input class="note-title-input" id="noteTitleInput" type="text" placeholder="Untitled note" />
       <div class="toolbar-divider"></div>
 
@@ -2920,6 +2958,8 @@ function selectNote(id) {
   document.getElementById('emptyState').style.display = 'none';
   document.getElementById('toolbar').style.display = 'flex';
   document.getElementById('noteSurface').style.display = 'flex';
+  // Phones hide the brand bar while a note is open — see body.note-open in CSS
+  document.body.classList.add('note-open');
 
   // Set title
   document.getElementById('noteTitleInput').value = note.title;
@@ -3699,6 +3739,7 @@ function showFolderGrid() {
   document.getElementById('emptyState').style.display = 'none';
   document.getElementById('toolbar').style.display = 'none';
   document.getElementById('noteSurface').style.display = 'none';
+  document.body.classList.remove('note-open');
   document.getElementById('folderGridView').style.display = 'flex';
 
   renderFolderGrid();
@@ -4010,6 +4051,7 @@ function showEmpty() {
   }
   document.getElementById('toolbar').style.display = 'none';
   document.getElementById('noteSurface').style.display = 'none';
+  document.body.classList.remove('note-open');
   document.getElementById('emptyState').style.display = 'flex';
 }
 
@@ -4189,12 +4231,16 @@ function closeSidebar() {
   document.getElementById('newDropdown').classList.remove('open');
   closeNoteMenu();
 }
-document.getElementById('btnMenu').addEventListener('click', e => {
-  // btnMenu lives inside #main, so its click would otherwise bubble into
-  // #main's own listener below and immediately re-close what this just opened
-  e.stopPropagation();
-  document.getElementById('sidebar').classList.toggle('open');
-  document.getElementById('sidebarOverlay').classList.toggle('open');
+// Two entry points to the drawer: the brand bar's button when no note is open,
+// and the toolbar's when one is (the brand bar is hidden then on phones).
+['btnMenu', 'btnMenuToolbar'].forEach(id => {
+  document.getElementById(id).addEventListener('click', e => {
+    // Both live inside #main, so the click would otherwise bubble into #main's
+    // own listener below and immediately re-close what this just opened
+    e.stopPropagation();
+    document.getElementById('sidebar').classList.toggle('open');
+    document.getElementById('sidebarOverlay').classList.toggle('open');
+  });
 });
 document.getElementById('sidebarOverlay').addEventListener('click', closeSidebar);
 document.getElementById('main').addEventListener('click', closeSidebar);
