@@ -131,3 +131,13 @@ create trigger on_auth_user_created
 insert into public.profiles (id)
 select id from auth.users
 on conflict (id) do nothing;
+
+-- ════════════════════════════════════════════════════════════════════════
+-- Imported documents (PDF / image annotation) — run once in SQL Editor.
+-- ════════════════════════════════════════════════════════════════════════
+
+-- Metadata only: file name, page count, page aspect — never the file bytes.
+-- The file itself and the per-page ink live in IndexedDB on-device (and, once
+-- Stage 2 lands, a Storage bucket). Without this column a cloud sync would
+-- overwrite the local note and silently drop its attachment.
+alter table notes add column doc_meta jsonb;

@@ -909,6 +909,56 @@
       will-change: transform;
     }
 
+    /* Stacked under the ink canvas: both are absolutely positioned siblings in
+       #canvasTransformWrap, so they zoom and pan together as one page. */
+    .page-bg {
+      position: absolute;
+      top: 0;
+      left: 0;
+      z-index: 0;
+      /* Blank for ordinary notes — the ink canvas paints the paper itself */
+      background: transparent;
+      box-shadow: none;
+      pointer-events: none;
+    }
+
+    /* Floating page navigation for imported multi-page documents */
+    .page-bar {
+      position: absolute;
+      bottom: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 4px 6px;
+      box-shadow: 0 4px 20px #00000055;
+      z-index: 5;
+    }
+    .page-btn {
+      background: none;
+      border: none;
+      color: var(--text);
+      cursor: pointer;
+      padding: 6px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .page-btn:hover:not(:disabled) { color: var(--accent); }
+    .page-btn:disabled { opacity: 0.3; cursor: default; }
+    .page-label {
+      font-size: 12px;
+      color: var(--text-muted);
+      min-width: 54px;
+      text-align: center;
+      font-variant-numeric: tabular-nums;
+    }
+
     .note-canvas {
       background: var(--canvas-bg);
       border-radius: 4px;
@@ -933,7 +983,18 @@
       top: 0;
       left: 0;
       pointer-events: none;
+      z-index: 2; /* the in-progress stroke draws above the committed ink */
     }
+
+    /* Explicit stacking: #pageBg is positioned, so without this it would paint
+       ABOVE the (statically positioned) ink canvas and hide every stroke. */
+    #noteCanvas { position: relative; z-index: 1; }
+
+    /* With a document imported, the ink layer must be see-through or its own
+       paper background would cover the page underneath. #pageBg then owns the
+       paper look (white fill + shadow) instead. */
+    .note-canvas.has-doc { background: transparent; box-shadow: none; }
+    .page-bg.has-doc { background: #fff; box-shadow: 0 4px 40px #00000055; }
 
     /* ── Zoom controls (ink mode only, see setMode()) ── */
     .zoom-controls {
@@ -1345,6 +1406,14 @@
             </svg>
             New Folder
           </button>
+          <button class="new-dropdown-item" id="btnImportFile">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="15" height="15">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="7 10 12 15 17 10"/>
+              <line x1="12" y1="15" x2="12" y2="3"/>
+            </svg>
+            Import PDF / Image
+          </button>
         </div>
       </div>
     </div>
@@ -1509,6 +1578,15 @@
 
       <span class="save-status" id="saveStatus">saved</span>
 
+      <!-- Import a PDF/image into THIS note (the + New menu creates a new one) -->
+      <button class="btn-icon" id="btnImportIntoNote" title="Import PDF / image into this note">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="7 10 12 15 17 10"/>
+          <line x1="12" y1="15" x2="12" y2="3"/>
+        </svg>
+      </button>
+
       <!-- Export buttons (PNG / PDF / TXT). TXT is type-mode only, see setMode() -->
       <button class="btn-icon" id="btnExportPNG" title="Export as PNG">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
@@ -1558,8 +1636,25 @@
     <div class="note-surface" id="noteSurface" style="display:none">
       <div class="canvas-wrap" id="canvasWrap">
         <div id="canvasTransformWrap">
+          <!-- Imported PDF page / image sits beneath the ink layer -->
+          <canvas class="note-canvas page-bg" id="pageBg"></canvas>
           <canvas class="note-canvas" id="noteCanvas"></canvas>
           <canvas class="note-canvas" id="bufferCanvas" style="display:none"></canvas>
+        </div>
+
+        <!-- Page navigation: only shown for notes with a multi-page import -->
+        <div class="page-bar" id="pageBar" style="display:none">
+          <button class="page-btn" id="pagePrev" title="Previous page">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="15 18 9 12 15 6"/>
+            </svg>
+          </button>
+          <span class="page-label" id="pageLabel">1 / 1</span>
+          <button class="page-btn" id="pageNext" title="Next page">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="9 18 15 12 9 6"/>
+            </svg>
+          </button>
         </div>
         <!-- Zoom controls: ink mode only, see setMode() -->
         <div class="zoom-controls" id="zoomControls">
@@ -1601,6 +1696,10 @@
     </div>
   </div>
 </div>
+
+<!-- Single hidden picker shared by both import entry points (+ New menu and
+     the toolbar button); importTarget decides which note receives the file -->
+<input type="file" id="fileImportInput" accept="application/pdf,image/*" style="display:none" />
 
 <script>
 // ── Safe localStorage helper — must be defined first ──
@@ -1835,6 +1934,10 @@ async function upsertNoteToCloud(note) {
         pan_x: note.panX || 0,
         pan_y: note.panY || 0,
         folder_id: note.folderId || null,
+        // Metadata only (name/pageCount/aspect) — the file bytes and per-page
+        // ink stay in IndexedDB. Synced so another device at least knows this
+        // note is an import, and so a sync can't wipe the attachment locally.
+        doc_meta: note.doc || null,
         updated_at: new Date().toISOString()
       }, { onConflict: 'id' })
       .select();
@@ -1919,6 +2022,8 @@ function mapCloudNoteToLocal(cloudNote) {
     panX: cloudNote.pan_x,
     panY: cloudNote.pan_y,
     folderId: cloudNote.folder_id || null,
+    doc: cloudNote.doc_meta || null,
+    pageIndex: 0,
     created: new Date(cloudNote.created_at).getTime(),
     updated: new Date(cloudNote.updated_at).getTime()
   };
@@ -2307,6 +2412,12 @@ const ctx = canvas.getContext('2d');
 // Scratch canvas for the currently-active stroke (see startDraw/draw/endDraw)
 const bufferCanvas = document.getElementById('bufferCanvas');
 const bufferCtx = bufferCanvas.getContext('2d');
+
+// Imported page (PDF page or image) painted UNDER the ink layer. Stays empty
+// for ordinary notes. Ink is never flattened onto it — that's what keeps the
+// original document intact while strokes can still be erased off it.
+const pageBg = document.getElementById('pageBg');
+const pageBgCtx = pageBg.getContext('2d');
 
 // Scratch canvas used only to downscale undo snapshots (see saveSnapshot)
 const undoCanvas = document.createElement('canvas');
@@ -2832,6 +2943,15 @@ async function deleteNote(id) {
   const wasPendingCreate = getPendingCreates().some(p => p.id === id && p.type === 'note');
   removePendingCreate(id);
 
+  // Drop the imported file and every page's ink with the note, or IndexedDB
+  // keeps growing with documents nothing references any more.
+  const doomed = notes.find(n => n.id === id);
+  if (doomed && doomed.doc) {
+    if (pdfCache.fileId === doomed.doc.fileId) pdfCache = { fileId: null, pdf: null };
+    idbDel(STORE_FILES, doomed.doc.fileId).catch(err => console.error(err));
+    idbDelNoteInk(id).catch(err => console.error(err));
+  }
+
   // Optimistic: local state and UI update immediately, before the cloud
   // delete even starts — the user should never wait on a network round trip
   // just to see a note disappear from the list.
@@ -2877,13 +2997,24 @@ function getActive() { return notes.find(n => n.id === activeId); }
 function saveActiveNote(immediate = false) {
   const note = getActive();
   if (!note) return;
+  // A queued debounced save is now redundant, and on an imported note it is
+  // actively harmful: if it fires after a page flip it writes the page being
+  // left behind under the NEW page's key, copying ink onto the wrong page.
+  clearTimeout(saveTimer);
   note.title = document.getElementById('noteTitleInput').value;
   note.updated = Date.now();
   note.type = mode;
   note.zoom = zoom;
   note.panX = panX;
   note.panY = panY;
-  if (mode === 'ink') {
+  if (mode === 'ink' && note.doc) {
+    // Imported pages keep ink per page in IndexedDB, transparent so the
+    // document stays visible beneath it. note.inkData is deliberately left
+    // alone — flattening here would bake the PDF into the note row.
+    savePageInk(note);
+    saveNotes();
+    upsertNoteToCloud(note).catch(err => console.error('Background sync failed:', err));
+  } else if (mode === 'ink') {
     const encode = () => {
       // JPEG instead of PNG: 3-5x smaller (faster to encode/decode, less
       // localStorage used) — quality 0.85 is visually indistinguishable for
@@ -2979,7 +3110,17 @@ function selectNote(id) {
   undoStack = [];
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   document.getElementById('noteTextarea').value = note.textData || '';
-  if (note.inkData) {
+
+  // An imported note keeps its ink per page in IndexedDB, and its page shape
+  // differs from the default, so it takes a separate path from note.inkData.
+  // renderNotePage() also restores the default page for ordinary notes, which
+  // is what undoes a previous doc note's resize.
+  const pageGen = ++pageRenderToken; // this navigation owns the canvas from here
+  renderNotePage(note, pageGen).then(() => {
+    if (note.doc && pageGen === pageRenderToken) return loadPageInk(note, pageGen);
+  });
+
+  if (!note.doc && note.inkData) {
     const img = new Image();
     img.onload = () => {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -3046,21 +3187,325 @@ function getCanvasDims() {
   return { w: 3000, h: 2000 };
 }
 
+// ══ Imported documents (PDF / image) ══
+// A lecture PDF is orders of magnitude too big for localStorage (~5MB total)
+// and for the notes table, so the file itself and each page's ink overlay
+// live in IndexedDB. The note row carries only note.doc metadata, which is
+// small enough to sync — see the doc_meta column in setup.sql.
+
+const DOC_DB_NAME = 'welovenote_docs';
+const STORE_FILES = 'files';   // fileId -> File/Blob, the original document
+const STORE_INK = 'pageInk';   // `${noteId}:${pageIndex}` -> PNG data URL
+
+let docDbPromise = null;
+function docDb() {
+  if (!docDbPromise) {
+    docDbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open(DOC_DB_NAME, 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(STORE_FILES)) db.createObjectStore(STORE_FILES);
+        if (!db.objectStoreNames.contains(STORE_INK)) db.createObjectStore(STORE_INK);
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  return docDbPromise;
+}
+
+async function idbRun(storeName, mode, fn) {
+  const db = await docDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, mode);
+    const req = fn(tx.objectStore(storeName));
+    tx.onerror = () => reject(tx.error);
+    if (req) { req.onsuccess = () => resolve(req.result); req.onerror = () => reject(req.error); }
+    else tx.oncomplete = () => resolve();
+  });
+}
+
+const idbPut = (store, key, value) => idbRun(store, 'readwrite', s => s.put(value, key));
+const idbGet = (store, key) => idbRun(store, 'readonly', s => s.get(key));
+const idbDel = (store, key) => idbRun(store, 'readwrite', s => s.delete(key));
+
+// Every page's ink for one note, used when the note is deleted
+async function idbDelNoteInk(noteId) {
+  const keys = await idbRun(STORE_INK, 'readonly', s => s.getAllKeys());
+  const mine = (keys || []).filter(k => typeof k === 'string' && k.startsWith(noteId + ':'));
+  for (const k of mine) await idbDel(STORE_INK, k);
+}
+
+// pdf.js is ~300KB and most sessions never import anything, so it's fetched
+// on first use rather than at boot. The service worker caches it afterwards,
+// which is what makes a previously-imported PDF still open offline.
+let pdfjsPromise = null;
+function loadPdfJs() {
+  if (window.pdfjsLib) return Promise.resolve(window.pdfjsLib);
+  if (!pdfjsPromise) {
+    pdfjsPromise = new Promise((resolve, reject) => {
+      const base = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174';
+      const s = document.createElement('script');
+      s.src = base + '/pdf.min.js';
+      s.onload = () => {
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc = base + '/pdf.worker.min.js';
+        resolve(window.pdfjsLib);
+      };
+      s.onerror = () => { pdfjsPromise = null; reject(new Error('Could not load the PDF engine — check your connection')); };
+      document.head.appendChild(s);
+    });
+  }
+  return pdfjsPromise;
+}
+
+// Parsing a PDF is slow enough that re-doing it on every page flip is visible,
+// so the open document is kept until a different file is opened.
+let pdfCache = { fileId: null, pdf: null };
+async function getPdfFor(fileId, blob) {
+  if (pdfCache.fileId === fileId && pdfCache.pdf) return pdfCache.pdf;
+  const lib = await loadPdfJs();
+  const data = new Uint8Array(await blob.arrayBuffer());
+  const pdf = await lib.getDocument({ data }).promise;
+  pdfCache = { fileId, pdf };
+  return pdf;
+}
+
+// Imported pages keep their own shape (PDFs are usually portrait, the default
+// note page is landscape), matching the default page's longest edge so the
+// drawing resolution stays in the same ballpark.
+function docPageDims(aspect) {
+  const base = getCanvasDims();
+  const budget = Math.max(base.w, base.h);
+  return aspect >= 1
+    ? { w: budget, h: Math.round(budget / aspect) }
+    : { w: Math.round(budget * aspect), h: budget };
+}
+
+function inkKey(note, page) { return `${note.id}:${page ?? note.pageIndex ?? 0}`; }
+
+// PNG, not the JPEG ordinary notes use: the ink layer has to stay transparent
+// so the document shows through underneath it.
+async function savePageInk(note) {
+  if (!note || !note.doc) return;
+  try { await idbPut(STORE_INK, inkKey(note), canvas.toDataURL('image/png')); }
+  catch (err) { console.error('Could not save page ink:', err); }
+}
+
+// One generation per navigation — a note switch or a page flip bumps it, and
+// the render/ink-load pair for that navigation carries the value through.
+// Painting a page involves several awaits (IndexedDB, PDF parse, image
+// decode), so a chain started before the latest navigation must not paint its
+// now-stale content. Callers bump it; the functions below only compare, or
+// two chains for the same navigation would cancel each other.
+let pageRenderToken = 0;
+
+async function loadPageInk(note, token = pageRenderToken) {
+  ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+  let url = null;
+  try { url = await idbGet(STORE_INK, inkKey(note)); } catch (err) { console.error('Could not read page ink:', err); }
+  if (token !== pageRenderToken) return;
+  if (url) {
+    await new Promise(res => {
+      const img = new Image();
+      img.onload = () => {
+        if (token === pageRenderToken) ctx.drawImage(img, 0, 0, CANVAS_W, CANVAS_H);
+        res();
+      };
+      img.onerror = res;
+      img.src = url;
+    });
+    if (token !== pageRenderToken) return;
+  }
+  undoStack = [];
+  saveSnapshot();
+}
+
+// Paints the note's current page into #pageBg and sizes the canvases to it.
+// For a note with no import it just restores the default page and clears the
+// background, so this is safe to call on every note switch.
+async function renderNotePage(note, token = pageRenderToken) {
+  const bar = document.getElementById('pageBar');
+  const hasDoc = !!(note && note.doc);
+
+  canvas.classList.toggle('has-doc', hasDoc);
+  pageBg.classList.toggle('has-doc', hasDoc);
+
+  const dims = hasDoc ? docPageDims(note.doc.aspect || 1) : getCanvasDims();
+  if (dims.w !== CANVAS_W || dims.h !== CANVAS_H) initCanvasSize(dims);
+  pageBgCtx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+
+  if (!hasDoc) { bar.style.display = 'none'; return; }
+
+  let blob = null;
+  try { blob = await idbGet(STORE_FILES, note.doc.fileId); } catch (err) { console.error(err); }
+  if (!blob) {
+    // The metadata synced from another device but the bytes never left it.
+    updatePageBar(note);
+    showToast(`"${note.doc.name}" isn't on this device yet — import it again here`, 5000);
+    return;
+  }
+
+  try {
+    if (note.doc.kind === 'pdf') {
+      const pdf = await getPdfFor(note.doc.fileId, blob);
+      const page = await pdf.getPage((note.pageIndex || 0) + 1);
+      // Parsing/rendering is slow enough that the user can flip pages or
+      // switch notes mid-flight; painting then would put this page under
+      // another page's ink
+      if (activeId !== note.id || token !== pageRenderToken) return;
+      const natural = page.getViewport({ scale: 1 });
+      // pageBgCtx is already scale(DPR,DPR)'d, so render at logical size and
+      // the device pixels come out right without double-scaling.
+      await page.render({
+        canvasContext: pageBgCtx,
+        viewport: page.getViewport({ scale: CANVAS_W / natural.width }),
+      }).promise;
+    } else {
+      const bmp = await createImageBitmap(blob);
+      if (activeId !== note.id || token !== pageRenderToken) { bmp.close?.(); return; }
+      pageBgCtx.drawImage(bmp, 0, 0, CANVAS_W, CANVAS_H);
+      bmp.close?.();
+    }
+  } catch (err) {
+    console.error('Could not render the imported page:', err);
+    showToast('Could not display this page', 4000);
+  }
+  updatePageBar(note);
+}
+
+function updatePageBar(note) {
+  const bar = document.getElementById('pageBar');
+  if (!note || !note.doc || note.doc.pageCount <= 1) { bar.style.display = 'none'; return; }
+  const page = note.pageIndex || 0;
+  bar.style.display = 'flex';
+  document.getElementById('pageLabel').textContent = `${page + 1} / ${note.doc.pageCount}`;
+  document.getElementById('pagePrev').disabled = page === 0;
+  document.getElementById('pageNext').disabled = page >= note.doc.pageCount - 1;
+}
+
+let pageSwitchBusy = false;
+async function goToPage(index) {
+  const note = getActive();
+  if (!note || !note.doc || pageSwitchBusy) return;
+  const target = Math.max(0, Math.min(note.doc.pageCount - 1, index));
+  if (target === (note.pageIndex || 0)) return;
+
+  pageSwitchBusy = true;
+  try {
+    // Must happen before pageIndex moves — see saveActiveNote's own note on
+    // why a pending debounced save is dangerous across a page flip.
+    clearTimeout(saveTimer);
+    await savePageInk(note); // keep whatever was drawn on the page being left
+    note.pageIndex = target;
+    note.updated = Date.now();
+    saveNotes();
+    const pageGen = ++pageRenderToken;
+    await renderNotePage(note, pageGen); // resizes + repaints the background
+    await loadPageInk(note, pageGen);    // must follow: the resize clears the ink canvas
+  } finally {
+    pageSwitchBusy = false;
+  }
+}
+
+// ── Import ──
+// 'current' drops the file into the open note; 'new' makes a note for it.
+let importTarget = 'new';
+
+function openFilePicker(target) {
+  importTarget = target;
+  const input = document.getElementById('fileImportInput');
+  input.value = ''; // so re-picking the same file still fires change
+  input.click();
+}
+
+async function handleFileImport(file) {
+  if (!file) return;
+  const kind = file.type === 'application/pdf' ? 'pdf' : 'image';
+  if (kind === 'image' && !file.type.startsWith('image/')) {
+    showToast('Only PDF and image files can be imported', 4000);
+    return;
+  }
+
+  showToast(`Importing ${file.name}…`, 2500);
+  const fileId = generateId();
+  let pageCount = 1, aspect = 1;
+
+  try {
+    if (kind === 'pdf') {
+      const pdf = await getPdfFor(fileId, file);
+      pageCount = pdf.numPages;
+      const vp = (await pdf.getPage(1)).getViewport({ scale: 1 });
+      aspect = vp.width / vp.height;
+    } else {
+      const bmp = await createImageBitmap(file);
+      aspect = bmp.width / bmp.height;
+      bmp.close?.();
+    }
+    await idbPut(STORE_FILES, fileId, file);
+  } catch (err) {
+    console.error('Import failed:', err);
+    showToast(err.message || 'Could not read that file', 5000);
+    return;
+  }
+
+  const doc = { fileId, name: file.name, kind, pageCount, aspect };
+
+  if (importTarget === 'current' && getActive()) {
+    const note = getActive();
+    await savePageInk(note); // don't lose ink already drawn on a previous import
+    note.doc = doc;
+    note.pageIndex = 0;
+    note.type = 'ink';
+    note.updated = Date.now();
+    if (!note.title) note.title = file.name.replace(/\.[^.]+$/, '');
+    saveNotes();
+    upsertNoteToCloud(note).catch(err => console.error('Background sync failed:', err));
+    selectNote(note.id);
+  } else {
+    createNote();
+    const note = getActive();
+    note.doc = doc;
+    note.pageIndex = 0;
+    note.type = 'ink';
+    note.title = file.name.replace(/\.[^.]+$/, '');
+    document.getElementById('noteTitleInput').value = note.title;
+    saveNotes();
+    upsertNoteToCloud(note).catch(err => console.error('Background sync failed:', err));
+    selectNote(note.id);
+  }
+
+  showToast(pageCount > 1 ? `Imported ${pageCount} pages — draw anywhere` : 'Imported — draw anywhere', 3500);
+}
+
+document.getElementById('fileImportInput').addEventListener('change', e => {
+  handleFileImport(e.target.files && e.target.files[0]);
+});
+document.getElementById('btnImportFile').addEventListener('click', () => {
+  document.getElementById('newDropdown').classList.remove('open');
+  openFilePicker('new');
+});
+document.getElementById('btnImportIntoNote').addEventListener('click', () => openFilePicker('current'));
+document.getElementById('pagePrev').addEventListener('click', () => goToPage((getActive()?.pageIndex || 0) - 1));
+document.getElementById('pageNext').addEventListener('click', () => goToPage((getActive()?.pageIndex || 0) + 1));
+
 // The canvas is a fixed-size logical page (CANVAS_W x CANVAS_H), sized once.
 // Zoom/pan never touch these dimensions — they only move the CSS transform.
-function initCanvasSize() {
-  const dims = getCanvasDims();
+// `override` ({w,h}) is how an imported page takes over the page shape — a
+// PDF is usually portrait while the default page is landscape, so a doc note
+// resizes the canvas to its own aspect on open (see applyDocPageSize).
+function initCanvasSize(override) {
+  const dims = override || getCanvasDims();
   CANVAS_W = dims.w;
   CANVAS_H = dims.h;
   DPR = Math.min(window.devicePixelRatio || 1, 2); // cap regardless of actual screen density
 
-  [canvas, bufferCanvas].forEach(c => {
+  [canvas, bufferCanvas, pageBg].forEach(c => {
     c.style.width = CANVAS_W + 'px';
     c.style.height = CANVAS_H + 'px';
     c.width = CANVAS_W * DPR;
     c.height = CANVAS_H * DPR;
   });
-  [ctx, bufferCtx].forEach(c => {
+  [ctx, bufferCtx, pageBgCtx].forEach(c => {
     c.scale(DPR, DPR);
     c.lineCap = 'round';
     c.lineJoin = 'round';
@@ -4093,9 +4538,12 @@ function flattenLayers() {
   const bg = vars.getPropertyValue('--canvas-bg').trim() || '#F0EDE6';
   const ink = vars.getPropertyValue('--ink').trim() || '#1A1A1A';
 
-  // Paper background, then the ink drawing on top of it
+  // Paper background, then the imported page (if any), then the ink on top —
+  // so exporting an annotated PDF page includes the page itself, not just
+  // the strokes floating on blank paper.
   fctx.fillStyle = bg;
   fctx.fillRect(0, 0, flat.width, flat.height);
+  if (getActive()?.doc) fctx.drawImage(pageBg, 0, 0);
   fctx.drawImage(canvas, 0, 0);
 
   // The typed text, laid out the same way it appears in .note-textarea
