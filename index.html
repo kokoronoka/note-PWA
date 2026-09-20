@@ -623,6 +623,37 @@
     .btn-refresh.spinning svg { animation: spin 0.8s linear infinite; }
     .btn-refresh:disabled { opacity: 0.4; cursor: not-allowed; }
 
+    .plan-row { justify-content: space-between; }
+    .plan-row[hidden] { display: none; }
+    .plan-badge {
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+    }
+    .plan-badge.pro, .plan-badge.business {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+    .btn-upgrade {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      font-family: var(--font-ui);
+      font-size: 11px;
+      font-weight: 600;
+      padding: 5px 10px;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }
+    .btn-upgrade:hover { opacity: 0.85; }
+    .btn-upgrade:disabled { opacity: 0.5; cursor: wait; }
+
     .user-email {
       flex: 1;
       min-width: 0; /* required for text-overflow:ellipsis to work inside a flex row */
@@ -1280,6 +1311,10 @@
     <div class="folders-list" id="foldersList"></div>
     <div class="notes-list" id="notesList"></div>
     <div class="sidebar-footer">
+      <div class="sidebar-footer-row plan-row" id="planRow" hidden>
+        <span class="plan-badge" id="planBadge">Free</span>
+        <button class="btn-upgrade" id="btnUpgrade">Upgrade to Pro</button>
+      </div>
       <div class="sidebar-footer-row">
         <span id="syncDot" title="Sync status"></span>
         <span id="userEmail" class="user-email"></span>
@@ -4209,6 +4244,8 @@ async function bootApp() {
   document.getElementById('btnRefresh').style.display = currentUser ? 'flex' : 'none';
   updateGuestBanner();
   updateSyncDot();
+  // Not awaited — a slow profile read shouldn't hold up showing the notes.
+  loadProfile().then(handleCheckoutReturn);
   if (!appInitialized) {
     appInitialized = true;
     await initApp();
@@ -4247,6 +4284,112 @@ function updateSyncDot() {
     dot.className = 'local-only';
     dot.title = 'Local only — sign in to sync';
   }
+}
+
+// ── Subscription profile (read-only here — only the stripe-webhook Edge
+// Function can write profiles; see setup.sql) ──
+let currentProfile = null;
+
+async function loadProfile() {
+  if (!currentUser) { currentProfile = null; updatePlanUI(); return null; }
+  const userId = currentUser.id;
+  try {
+    const { data, error } = await supabaseClient
+      .from('profiles')
+      .select('subscription_tier, subscription_status, current_period_end')
+      .eq('id', userId)
+      .maybeSingle();
+    if (error) throw error;
+    // A sign-out/account switch mid-request must not leave the old user's plan applied
+    if (currentUser?.id !== userId) return currentProfile;
+    currentProfile = data;
+  } catch (err) {
+    console.warn('Could not load subscription profile:', err);
+  }
+  updatePlanUI();
+  return currentProfile;
+}
+
+function getUserTier() {
+  return currentProfile?.subscription_tier || 'free';
+}
+
+function hasProAccess() {
+  const tier = getUserTier();
+  return tier === 'pro' || tier === 'business';
+}
+
+function hasBusinessAccess() {
+  return getUserTier() === 'business';
+}
+
+function updatePlanUI() {
+  const row = document.getElementById('planRow');
+  if (!currentUser) { row.hidden = true; return; }
+  const tier = getUserTier();
+  const badge = document.getElementById('planBadge');
+  badge.textContent = tier === 'business' ? 'Business' : tier === 'pro' ? 'Pro' : 'Free';
+  badge.className = 'plan-badge ' + tier;
+  document.getElementById('btnUpgrade').hidden = tier !== 'free';
+  row.hidden = false;
+}
+
+async function startCheckout(plan = 'pro') {
+  const user = await getValidUser();
+  if (!user) { showAuthScreen(); return; }
+
+  const btn = document.getElementById('btnUpgrade');
+  btn.disabled = true;
+  btn.textContent = 'Opening checkout…';
+  try {
+    const { data, error } = await supabaseClient.functions.invoke('create-checkout-session', {
+      body: { plan, returnUrl: window.location.origin + window.location.pathname },
+    });
+    if (error) {
+      let message = 'Could not start checkout — please try again';
+      try { message = (await error.context.json()).error || message; } catch {}
+      throw new Error(message);
+    }
+    if (!data?.url) throw new Error('Could not start checkout — please try again');
+    window.location.assign(data.url);
+  } catch (err) {
+    console.error('Checkout failed:', err);
+    showToast(err.message, 4000);
+    btn.disabled = false;
+    btn.textContent = 'Upgrade to Pro';
+  }
+}
+
+document.getElementById('btnUpgrade').addEventListener('click', () => startCheckout('pro'));
+
+// Stripe redirects back with ?checkout=success|cancel. The webhook that
+// actually flips the tier races this redirect, so poll briefly rather than
+// trusting a single read.
+let checkoutReturnHandled = false;
+
+async function handleCheckoutReturn() {
+  const params = new URLSearchParams(window.location.search);
+  const result = params.get('checkout');
+  if (!result || checkoutReturnHandled || !currentUser) return;
+  checkoutReturnHandled = true;
+
+  params.delete('checkout');
+  const qs = params.toString();
+  history.replaceState(null, '', window.location.pathname + (qs ? '?' + qs : '') + window.location.hash);
+
+  if (result === 'cancel') { showToast('Checkout canceled — you have not been charged', 3000); return; }
+  if (result !== 'success') return;
+
+  showToast('Payment received — activating your plan…', 3000);
+  for (let attempt = 0; attempt < 10; attempt++) {
+    await loadProfile();
+    if (hasProAccess()) {
+      showToast(`You're on ${getUserTier() === 'business' ? 'Business' : 'Pro'} now. Thank you!`, 4000);
+      return;
+    }
+    await new Promise(r => setTimeout(r, 2000));
+  }
+  showToast('Your payment went through, but activation is taking longer than usual. Refresh in a minute.', 6000);
 }
 
 // "Continue without an account" — boots the app exactly like a real sign-in
@@ -4425,6 +4568,8 @@ async function handleSignOut() {
   activeId = null;
   activeFolderId = null;
   currentUser = null;
+  currentProfile = null;
+  updatePlanUI();
 
   // This app's own cached state. Supabase's 'sb-*' keys are cleared by
   // signOut() itself below, not here — a queued create/delete left behind
@@ -4489,6 +4634,8 @@ supabaseClient.auth.onAuthStateChange(async (event, session) => {
     activeFolderId = null;
     appInitialized = false;
     migrationOfferedThisSession = false; // a fresh login after this gets its own migration offer
+    currentProfile = null;
+    updatePlanUI();
     document.getElementById('authEmail').value = '';
     document.getElementById('authPassword').value = '';
     updateGuestBanner();

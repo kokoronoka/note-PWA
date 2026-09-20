@@ -79,3 +79,55 @@ alter table notes add column folder_id text references folders(id) on delete set
 -- (CHANNEL_ERROR), which would also explain new notes silently failing to
 -- sync, not just folders.
 alter publication supabase_realtime add table folders;
+
+-- ════════════════════════════════════════════════════════════════════════
+-- Welovenote subscriptions (Monetization Phase A) — run once in SQL Editor.
+-- ════════════════════════════════════════════════════════════════════════
+
+create table profiles (
+  id                      uuid references auth.users(id) on delete cascade primary key,
+  subscription_tier       text not null default 'free'
+                            check (subscription_tier in ('free', 'pro', 'business')),
+  subscription_status     text not null default 'active',
+  stripe_customer_id      text unique,
+  stripe_subscription_id  text,
+  current_period_end      timestamptz,
+  created_at              timestamptz default now(),
+  updated_at              timestamptz default now()
+);
+
+alter table profiles enable row level security;
+
+-- Read-only for the owner. There is deliberately NO insert/update/delete
+-- policy: only the Edge Functions (service_role key, which bypasses RLS) may
+-- write here. A client-writable subscription_tier would let anyone grant
+-- themselves Pro from the browser console.
+create policy "Users can read own profile"
+on profiles for select
+using (auth.uid() = id);
+
+-- RLS already blocks writes, but revoke the table privileges too so a future
+-- permissive policy added by mistake still can't open this up to the browser.
+revoke insert, update, delete on profiles from anon, authenticated;
+
+create or replace function public.handle_new_user()
+returns trigger
+language plpgsql
+security definer set search_path = public
+as $$
+begin
+  insert into public.profiles (id) values (new.id)
+  on conflict (id) do nothing;
+  return new;
+end;
+$$;
+
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute procedure public.handle_new_user();
+
+-- Backfill: the trigger only fires for sign-ups from now on, so every account
+-- that already exists needs its row created once here.
+insert into public.profiles (id)
+select id from auth.users
+on conflict (id) do nothing;
