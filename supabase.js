@@ -7,7 +7,7 @@
 // correct URL instead. If that's not actually this project, replace it with
 // the exact URL from Project Settings → API → Project URL.
 const SUPABASE_URL = 'https://dcufzmecjdnjymgksvmh.supabase.co';
-const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRjdWZ6bWVjamRuanltZ2tzdm1oIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgxMzEyODMsImV4cCI6MjEwMzcwNzI4M30.9m9P_6ecxxUoNU3gc8R2Jzf8c50sAENc3J9V_94228w';
+const SUPABASE_ANON_KEY = 'sb_publishable_Mtbe5sPE9_OWZIIXG3HVcQ_YCuk5rZ0';
 // Named supabaseClient, not supabase — the CDN UMD bundle itself declares a
 // top-level `var supabase = ...` as its own global export, and a `const
 // supabase` here would collide with it ("Identifier 'supabase' has already
