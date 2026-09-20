@@ -922,6 +922,21 @@
       pointer-events: none;
     }
 
+    .page-loading {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 8px 18px;
+      font-size: 12px;
+      color: var(--text-muted);
+      z-index: 6;
+      pointer-events: none;
+    }
+
     /* Floating page navigation for imported multi-page documents */
     .page-bar {
       position: absolute;
@@ -1641,6 +1656,10 @@
           <canvas class="note-canvas" id="noteCanvas"></canvas>
           <canvas class="note-canvas" id="bufferCanvas" style="display:none"></canvas>
         </div>
+
+        <!-- Shown while an imported page is decoding, so the wait doesn't
+             read as a blank page (the first import also fetches pdf.js) -->
+        <div class="page-loading" id="pageLoading" style="display:none">Rendering page…</div>
 
         <!-- Page navigation: only shown for notes with a multi-page import -->
         <div class="page-bar" id="pageBar" style="display:none">
@@ -3277,16 +3296,19 @@ async function getPdfFor(fileId, blob) {
 function docPageDims(aspect) {
   const base = getCanvasDims();
   const budget = Math.max(base.w, base.h);
-  const dims = aspect >= 1
-    ? { w: budget, h: Math.round(budget / aspect) }
-    : { w: Math.round(budget * aspect), h: budget };
-  // Three canvases (page, ink, stroke buffer) are all allocated at this size
-  // times DPR squared. At DPR 2 that was ~73MB on a phone, which is where
-  // iOS starts silently discarding canvas backing stores — the page and the
-  // strokes both just turn blank. 1.5 keeps a PDF crisp at fit-to-width
-  // while cutting that by about half.
-  dims.dpr = 1.5;
-  return dims;
+  let w = aspect >= 1 ? budget : Math.round(budget * aspect);
+  let h = aspect >= 1 ? Math.round(budget / aspect) : budget;
+
+  // Three canvases (page, ink, stroke buffer) are each allocated at this size
+  // times DPR squared. Unbounded, a portrait page came to ~14 megapixels each
+  // on desktop — about 172MB total, enough for the browser to fail an
+  // allocation and hand back a canvas that simply draws nothing. Capping the
+  // logical area keeps all three within a safe budget on every platform.
+  const MAX_PAGE_PIXELS = 2.6e6;
+  const shrink = Math.sqrt(MAX_PAGE_PIXELS / (w * h));
+  if (shrink < 1) { w = Math.round(w * shrink); h = Math.round(h * shrink); }
+
+  return { w, h, dpr: 1.5 };
 }
 
 function inkKey(note, page) { return `${note.id}:${page ?? note.pageIndex ?? 0}`; }
@@ -3297,10 +3319,16 @@ async function savePageInk(note) {
   if (!note || !note.doc) return;
   const key = inkKey(note); // resolved now: note.pageIndex may move while encoding
   try {
-    // toBlob instead of toDataURL: the encode runs off the main thread and
-    // skips base64, which is a third of the bytes and was a visible freeze on
-    // a multi-megapixel page. IndexedDB stores the Blob as-is.
-    const blob = await new Promise(res => canvas.toBlob(res, 'image/png'));
+    // Copy the pixels synchronously first. toBlob encodes asynchronously, and
+    // callers (note switch, page flip) clear or resize the live canvas
+    // immediately after calling this — encoding from it directly saved blank
+    // pages. The copy is a cheap blit; the expensive PNG encode still happens
+    // off the main thread, and skipping base64 drops a third of the bytes.
+    const snap = document.createElement('canvas');
+    snap.width = canvas.width;
+    snap.height = canvas.height;
+    snap.getContext('2d').drawImage(canvas, 0, 0);
+    const blob = await new Promise(res => snap.toBlob(res, 'image/png'));
     if (blob) await idbPut(STORE_INK, key, blob);
   } catch (err) { console.error('Could not save page ink:', err); }
 }
@@ -3352,19 +3380,33 @@ async function renderNotePage(note, token = pageRenderToken) {
   const bar = document.getElementById('pageBar');
   const hasDoc = !!(note && note.doc);
 
+  // bufferCanvas matters as much as the ink canvas here: startDraw() makes it
+  // visible on top for the duration of a stroke, so if it keeps its opaque
+  // paper background it hides the document the instant you start drawing.
   canvas.classList.toggle('has-doc', hasDoc);
+  bufferCanvas.classList.toggle('has-doc', hasDoc);
   pageBg.classList.toggle('has-doc', hasDoc);
 
   const dims = hasDoc ? docPageDims(note.doc.aspect || 1) : getCanvasDims();
   if (dims.w !== CANVAS_W || dims.h !== CANVAS_H) initCanvasSize(dims);
-  pageBgCtx.clearRect(0, 0, CANVAS_W, CANVAS_H);
 
-  if (!hasDoc) { bar.style.display = 'none'; return; }
+  if (!hasDoc) {
+    pageBgCtx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+    bar.style.display = 'none';
+    return;
+  }
+  // Deliberately NOT cleared here: the outgoing page stays on screen until
+  // the new one has finished rendering (see the blit below), instead of
+  // flashing blank for as long as the decode takes.
+  const loading = document.getElementById('pageLoading');
+  loading.style.display = 'block';
+  const doneLoading = () => { if (token === pageRenderToken) loading.style.display = 'none'; };
 
   let blob = null;
   try { blob = await idbGet(STORE_FILES, note.doc.fileId); } catch (err) { console.error(err); }
   if (!blob) {
     // The metadata synced from another device but the bytes never left it.
+    doneLoading();
     updatePageBar(note);
     showToast(`"${note.doc.name}" isn't on this device yet — import it again here`, 5000);
     return;
@@ -3377,15 +3419,25 @@ async function renderNotePage(note, token = pageRenderToken) {
       // Parsing/rendering is slow enough that the user can flip pages or
       // switch notes mid-flight; painting then would put this page under
       // another page's ink
-      if (activeId !== note.id || token !== pageRenderToken) return;
+      if (activeId !== note.id || token !== pageRenderToken) { doneLoading(); return; }
       const natural = page.getViewport({ scale: 1 });
       // pdf.js refuses two concurrent render() calls on one canvas and leaves
       // it blank if it happens, so any still-running render is cancelled first.
       if (activeRenderTask) { try { activeRenderTask.cancel(); } catch (err) {} }
-      // pageBgCtx is already scale(DPR,DPR)'d, so render at logical size and
-      // the device pixels come out right without double-scaling.
+
+      // Render into a scratch canvas, then blit in one step. Rendering
+      // straight into #pageBg would show the page building up over a blank
+      // background, which is the visible flicker on every flip.
+      const off = document.createElement('canvas');
+      off.width = Math.round(CANVAS_W * DPR);
+      off.height = Math.round(CANVAS_H * DPR);
+      const offCtx = off.getContext('2d');
+      offCtx.fillStyle = '#fff'; // PDFs assume paper, and render transparent where blank
+      offCtx.fillRect(0, 0, off.width, off.height);
+      offCtx.scale(DPR, DPR);
+
       activeRenderTask = page.render({
-        canvasContext: pageBgCtx,
+        canvasContext: offCtx,
         viewport: page.getViewport({ scale: CANVAS_W / natural.width }),
       });
       try {
@@ -3393,14 +3445,18 @@ async function renderNotePage(note, token = pageRenderToken) {
       } catch (err) {
         // A cancelled render is the expected outcome of flipping fast, not a
         // failure worth showing the user
-        if (err && err.name === 'RenderingCancelledException') return;
+        if (err && err.name === 'RenderingCancelledException') { doneLoading(); return; }
         throw err;
       } finally {
         activeRenderTask = null;
       }
+      if (activeId !== note.id || token !== pageRenderToken) return;
+      pageBgCtx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+      pageBgCtx.drawImage(off, 0, 0, CANVAS_W, CANVAS_H);
     } else {
       const bmp = await createImageBitmap(blob);
-      if (activeId !== note.id || token !== pageRenderToken) { bmp.close?.(); return; }
+      if (activeId !== note.id || token !== pageRenderToken) { bmp.close?.(); doneLoading(); return; }
+      pageBgCtx.clearRect(0, 0, CANVAS_W, CANVAS_H);
       pageBgCtx.drawImage(bmp, 0, 0, CANVAS_W, CANVAS_H);
       bmp.close?.();
     }
@@ -3408,6 +3464,7 @@ async function renderNotePage(note, token = pageRenderToken) {
     console.error('Could not render the imported page:', err);
     showToast('Could not display this page', 4000);
   }
+  doneLoading();
   updatePageBar(note);
 }
 
