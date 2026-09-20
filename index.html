@@ -2,7 +2,12 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!-- user-scalable=no / maximum-scale=1 stop the browser zooming the whole UI
+       (chrome, sidebar, toolbar) on pinch or double-tap, so this behaves like a
+       native app. The note canvas has its own pinch-zoom — see .note-canvas's
+       touch-action:none and updatePinch(). viewport-fit=cover lets the app fill
+       the screen past a notch in standalone mode. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
   <meta name="theme-color" content="#1A1A1A" />
   <meta name="description" content="Welovenote — write or draw your notes" />
   <link rel="manifest" href="manifest.json" />
@@ -47,6 +52,15 @@
       color: var(--text);
       font-family: var(--font-ui);
       overflow: hidden;
+      /* pan-x pan-y (rather than the laxer 'manipulation') allows scrolling but
+         denies the browser pinch-zoom and double-tap-zoom over the app shell.
+         .note-canvas opts out with touch-action:none and handles both itself. */
+      touch-action: pan-x pan-y;
+      /* Stops iOS inflating font sizes in landscape, which silently breaks the
+         fixed layout this viewport now promises */
+      -webkit-text-size-adjust: 100%;
+      /* No rubber-band overscroll / pull-to-refresh bouncing the whole app */
+      overscroll-behavior: none;
     }
     /* Column so #guestBanner (normal flow, natural height) can sit above
        #app without either of them needing a fixed/measured pixel height —
@@ -4659,6 +4673,14 @@ async function checkSession() {
   if (data && data.session) bootApp();
   else showAuthScreen();
 }
+
+// iOS Safari ignores user-scalable=no, so the meta tag alone doesn't stop it
+// zooming the whole app on a pinch — these proprietary gesture events are the
+// only way to refuse it there. Safe to block globally: the canvas runs its own
+// pinch-zoom off pointer events (updatePinch), which these don't touch.
+['gesturestart', 'gesturechange', 'gestureend'].forEach(evt => {
+  document.addEventListener(evt, e => e.preventDefault(), { passive: false });
+});
 
 registerSW();
 checkSession();
