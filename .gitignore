@@ -1,0 +1,8 @@
+# Supabase CLI installed via npm — 137MB of dependencies, restorable with `npm install`
+node_modules/
+
+# Supabase CLI scratch state and any local secrets (Stripe keys, service_role key)
+supabase/.temp/
+supabase/.branches/
+.env
+.env.*
