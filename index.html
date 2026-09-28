@@ -3147,6 +3147,7 @@ function selectNote(id) {
   // Resume on the page this note was left on, and set it BEFORE rendering —
   // everything below keys off currentDocPage, not the note object.
   currentDocPage = (note.doc && note.pageIndex) || 0;
+  pageInkReady = !note.doc; // a doc note's page ink is still loading
   const pageGen = ++pageRenderToken; // this navigation owns the canvas from here
   renderNotePage(note, pageGen).then(() => {
     if (note.doc && pageGen === pageRenderToken) return loadPageInk(note, pageGen);
@@ -3333,12 +3334,20 @@ function docPageDims(aspect) {
 // a note returns to the page you left.
 let currentDocPage = 0;
 
+// True only once the ink canvas is known to hold exactly currentDocPage's
+// strokes. Between a flip starting and that page's ink finishing loading, the
+// canvas still shows the previous page (or nothing yet) — saving it then would
+// write the wrong page's ink under this page's key, which is how numbers
+// drawn on one page ended up on others. Every save checks this first.
+let pageInkReady = true;
+
 function inkKey(note, page) { return `${note.id}:${page ?? currentDocPage}`; }
 
 // PNG, not the JPEG ordinary notes use: the ink layer has to stay transparent
 // so the document shows through underneath it.
 async function savePageInk(note) {
   if (!note || !note.doc) return;
+  if (!pageInkReady) return; // canvas doesn't hold this page's ink yet — see pageInkReady
   const key = inkKey(note); // resolved now: note.pageIndex may move while encoding
   try {
     // Copy the pixels synchronously first. toBlob encodes asynchronously, and
@@ -3393,6 +3402,7 @@ async function loadPageInk(note, token = pageRenderToken) {
   }
   undoStack = [];
   saveSnapshot();
+  pageInkReady = true; // only reached by the load for the current navigation
 }
 
 // Paints the note's current page into #pageBg and sizes the canvases to it.
@@ -3526,6 +3536,7 @@ async function goToPage(index) {
     // why a pending debounced save is dangerous across a page flip.
     clearTimeout(saveTimer);
     await savePageInk(note); // keep whatever was drawn on the page being left
+    pageInkReady = false;    // from here until loadPageInk finishes, the canvas is stale
     currentDocPage = target;
     note.pageIndex = target; // persisted only so reopening resumes on this page
     note.updated = Date.now();
@@ -3641,7 +3652,9 @@ function pageStep(delta) {
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible') return;
   const note = getActive();
-  if (note && note.doc) renderNotePage(note, ++pageRenderToken);
+  // No token bump: bumping would cancel an in-flight flip's ink load and
+  // leave the page with no ink shown. A flip in progress repaints anyway.
+  if (note && note.doc && !pageSwitchBusy) renderNotePage(note, pageRenderToken);
 });
 
 document.getElementById('pagePrev').addEventListener('click', () => pageStep(-1));
@@ -3808,6 +3821,9 @@ function getPos(e) {
 // canvas simultaneously, which stalls the render pipeline on mobile GPUs.
 function startDraw(e) {
   e.preventDefault();
+  // Mid-flip the canvas is about to be replaced by the new page's ink; a
+  // stroke started now would be wiped when it lands (and see pageInkReady).
+  if (!pageInkReady) return;
   const pos = getPos(e);
   drawing = true;
   lastX = pos.x;
