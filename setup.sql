@@ -141,3 +141,11 @@ on conflict (id) do nothing;
 -- Stage 2 lands, a Storage bucket). Without this column a cloud sync would
 -- overwrite the local note and silently drop its attachment.
 alter table notes add column doc_meta jsonb;
+
+-- ════════════════════════════════════════════════════════════════════════
+-- Paper style for ink notes (blank / grid) — run once in SQL Editor.
+-- ════════════════════════════════════════════════════════════════════════
+
+-- Optional: until this runs, the app drops the field and syncs everything
+-- else normally, so the paper style just stays per-device.
+alter table notes add column paper text default 'blank';
