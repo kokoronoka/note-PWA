@@ -2459,6 +2459,7 @@ let activeFolderId = null; // null = "All Notes" view
 let mainView = 'notes'; // 'notes' | 'folderGrid' — which content fills .main
 let mode = 'type'; // 'ink' | 'type'
 let drawing = false;
+let strokeOwner = null; // `${noteId}:${page}` the in-progress stroke was started on — see endDraw
 let lastX = 0, lastY = 0;
 let currentColor = '#1A1A1A';
 let strokeWidth = 3;
@@ -3042,7 +3043,10 @@ async function deleteNote(id) {
   if (doomed && doomed.doc) {
     if (pdfCache.fileId === doomed.doc.fileId) pdfCache = { fileId: null, pdf: null };
     idbDel(STORE_FILES, doomed.doc.fileId).catch(err => console.error(err));
-    idbDelNoteInk(id).catch(err => console.error(err));
+    // Let background ink saves for this note land first, or one finishing
+    // after the delete would leave an orphaned page behind in IndexedDB
+    const inFlight = [...pendingInkWrites].filter(([k]) => k.startsWith(id + ':')).map(([, p]) => p);
+    Promise.all(inFlight).then(() => idbDelNoteInk(id)).catch(err => console.error(err));
   }
 
   // Optimistic: local state and UI update immediately, before the cloud
@@ -3441,24 +3445,44 @@ function inkKey(note, page) { return `${note.id}:${page ?? currentDocPage}`; }
 
 // PNG, not the JPEG ordinary notes use: the ink layer has to stay transparent
 // so the document shows through underneath it.
-async function savePageInk(note) {
-  if (!note || !note.doc) return;
-  if (!pageInkReady) return; // canvas doesn't hold this page's ink yet — see pageInkReady
-  const key = inkKey(note); // resolved now: note.pageIndex may move while encoding
+// Page ink whose PNG encode / IndexedDB write hasn't landed yet, by key.
+// loadPageInk reads from here first, so flipping straight back to a page
+// shows its newest strokes rather than whatever IndexedDB held before.
+const pendingInkWrites = new Map();
+
+// Captures the page synchronously and returns immediately; the encode and
+// write finish in the background. The PNG encode takes a second or more on a
+// full page, and a page flip used to wait for it before switching — during
+// that second the old page stayed on screen and accepted strokes, which then
+// committed onto the next page carrying the old page's ink with them.
+function startSavePageInk(note) {
+  if (!note || !note.doc) return null;
+  if (!pageInkReady) return null; // canvas doesn't hold this page's ink yet — see pageInkReady
+  const key = inkKey(note);
   try {
-    // Copy the pixels synchronously first. toBlob encodes asynchronously, and
-    // callers (note switch, page flip) clear or resize the live canvas
-    // immediately after calling this — encoding from it directly saved blank
-    // pages. The copy is a cheap blit; the expensive PNG encode still happens
-    // off the main thread, and skipping base64 drops a third of the bytes.
+    // The pixel copy is what must happen now: callers clear or resize the
+    // live canvas immediately after this returns.
     const snap = document.createElement('canvas');
     snap.width = canvas.width;
     snap.height = canvas.height;
     snap.getContext('2d').drawImage(canvas, 0, 0);
-    const blob = await new Promise(res => snap.toBlob(res, 'image/png'));
-    if (blob) await idbPut(STORE_INK, key, blob);
-  } catch (err) { console.error('Could not save page ink:', err); }
+    const encoded = new Promise(res => snap.toBlob(res, 'image/png'));
+    // Chained per key so two saves of one page land in the order they were
+    // taken, regardless of which encode finishes first
+    const previous = pendingInkWrites.get(key) || Promise.resolve();
+    const done = Promise.all([encoded, previous.catch(() => {})])
+      .then(async ([blob]) => { if (blob) await idbPut(STORE_INK, key, blob); return blob; })
+      .catch(err => { console.error('Could not save page ink:', err); return null; })
+      .finally(() => { if (pendingInkWrites.get(key) === done) pendingInkWrites.delete(key); });
+    pendingInkWrites.set(key, done);
+    return done;
+  } catch (err) {
+    console.error('Could not capture page ink:', err);
+    return null;
+  }
 }
+
+async function savePageInk(note) { await startSavePageInk(note); }
 
 // One generation per navigation — a note switch or a page flip bumps it, and
 // the render/ink-load pair for that navigation carries the value through.
@@ -3470,8 +3494,13 @@ let pageRenderToken = 0;
 
 async function loadPageInk(note, token = pageRenderToken) {
   ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+  const key = inkKey(note);
   let url = null;
-  try { url = await idbGet(STORE_INK, inkKey(note)); } catch (err) { console.error('Could not read page ink:', err); }
+  try {
+    const pending = pendingInkWrites.get(key);
+    if (pending) url = await pending; // newer than IndexedDB until it lands
+    if (!url) url = await idbGet(STORE_INK, key);
+  } catch (err) { console.error('Could not read page ink:', err); }
   if (token !== pageRenderToken) return;
   if (url) {
     // Blob since the switch away from data URLs; strings are pages saved by
@@ -3631,7 +3660,12 @@ async function goToPage(index) {
     // Must happen before pageIndex moves — see saveActiveNote's own note on
     // why a pending debounced save is dangerous across a page flip.
     clearTimeout(saveTimer);
-    await savePageInk(note); // keep whatever was drawn on the page being left
+    // A stroke still in progress belongs to the page it was started on:
+    // commit it here, before that page is captured and the canvas moves on.
+    if (drawing) { flushPendingMove(); endDraw(); }
+    // Not awaited: the capture is synchronous, and waiting out the encode is
+    // what used to hold the old page on screen for a second after tapping Next.
+    startSavePageInk(note);
     pageInkReady = false;    // from here until loadPageInk finishes, the canvas is stale
     currentDocPage = target;
     note.pageIndex = target; // persisted only so reopening resumes on this page
@@ -3923,9 +3957,10 @@ function startDraw(e) {
   e.preventDefault();
   // Mid-flip the canvas is about to be replaced by the new page's ink; a
   // stroke started now would be wiped when it lands (and see pageInkReady).
-  if (!pageInkReady) return;
+  if (!pageInkReady || pageSwitchBusy) return;
   const pos = getPos(e);
   drawing = true;
+  strokeOwner = `${activeId}:${currentDocPage}`;
   lastX = pos.x;
   lastY = pos.y;
 
@@ -3963,6 +3998,14 @@ function endDraw(e) {
   if (!drawing) return;
   drawing = false;
   bufferCtx.globalCompositeOperation = 'source-over';
+
+  // The buffer was seeded with the canvas as it was when this stroke began.
+  // If the page or note changed since, committing it would paint the old
+  // page's entire ink onto the new one — drop the stroke instead.
+  if (strokeOwner !== `${activeId}:${currentDocPage}`) {
+    bufferCanvas.style.display = 'none';
+    return;
+  }
 
   // Commit the finished stroke onto the main canvas. Must clear first: under
   // source-over, a fully-transparent source pixel leaves the destination
